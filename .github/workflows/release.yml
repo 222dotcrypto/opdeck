@@ -1,0 +1,48 @@
+name: Release
+
+# Релиз macOS .dmg (universal: Apple Silicon + Intel) на пуш тега vX.Y.Z.
+# Подпись ad-hoc (без Apple-сертификата) → у пользователя предупреждение Gatekeeper,
+# снимается install.sh (xattr -dr com.apple.quarantine). Для нотаризации — добавить
+# секреты Apple Developer + TAURI_SIGNING_* (см. доку tauri-action).
+# ВНИМАНИЕ: перед первой публикацией сверить актуальную мажорную версию tauri-action.
+
+on:
+  push:
+    tags:
+      - 'v*'
+
+jobs:
+  release-macos:
+    runs-on: macos-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: lts/*
+          cache: npm
+
+      - name: Rust (universal targets)
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: aarch64-apple-darwin,x86_64-apple-darwin
+
+      - name: Install deps
+        run: npm ci
+
+      # tauri-action сам вызывает beforeBuildCommand (npm run build:web) из tauri.conf.json,
+      # затем собирает universal .dmg и создаёт GitHub Release с ассетом.
+      - name: Build + release
+        uses: tauri-apps/tauri-action@v0
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        with:
+          tagName: ${{ github.ref_name }}
+          releaseName: 'Deck ${{ github.ref_name }}'
+          releaseBody: 'См. историю коммитов.'
+          releaseDraft: false
+          prerelease: false
+          args: --target universal-apple-darwin
