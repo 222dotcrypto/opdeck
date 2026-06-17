@@ -1,0 +1,39 @@
+/* RFC 0017 §Scope 5 — дешёвые победы Monaco (минимап, сворачивание, мульти-курсор, change-bar) */
+
+/* Кнопка-тумблер минимапа в плавающей панели — как .mode-toggle button, но одиночная. */
+.editor-mini-btn {
+  padding: 3px 9px;
+  font-size: 11px;
+  color: var(--text-2);
+  background: var(--bg-3);
+  border: 1px solid var(--line);
+  border-radius: 7px;
+}
+.editor-mini-btn:hover { color: var(--text); border-color: var(--line-2); }
+.editor-mini-btn.on { background: #1f2a3a; color: var(--accent); border-color: var(--accent); }
+
+/* Тонкая подсказка снизу: сворачивание + мульти-курсор. Не перекрывает редактор. */
+.editor-hint {
+  position: absolute; left: 0; right: 0; bottom: 0; z-index: 20;
+  display: flex; align-items: center; gap: 14px;
+  padding: 2px 12px;
+  font-size: 10px; color: var(--text-2);
+  background: var(--bg-2); border-top: 1px solid var(--line);
+  pointer-events: none;
+  user-select: none;
+}
+.editor-hint kbd {
+  font-family: inherit;
+  color: var(--text);
+  background: var(--bg-3);
+  border: 1px solid var(--line-2);
+  border-radius: 4px;
+  padding: 0 4px;
+  font-size: 9.5px;
+}
+
+/* Change-bar — цветные полоски в гаттере по git-изменениям (RFC 0017 §Scope 5.4).
+   Рисуем через linearGradient на левом крае строки, ширина 3px. */
+.deck-cb-added    { background: linear-gradient(var(--ready), var(--ready)) left/3px 100% no-repeat; }
+.deck-cb-modified { background: linear-gradient(var(--accent), var(--accent)) left/3px 100% no-repeat; }
+.deck-cb-deleted  { background: linear-gradient(#f85149, #f85149) left/3px 100% no-repeat; }

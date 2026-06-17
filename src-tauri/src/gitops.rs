@@ -1,7 +1,9 @@
 use crate::types::{ChangedFile, DiffPair, MergeResult, WorktreeInfo};
+use std::collections::HashMap;
 use std::io::Write;
 use std::path::Path;
 use std::process::{Command, Stdio};
+use std::sync::{Mutex, OnceLock};
 
 fn git(folder: &str, args: &[&str]) -> Result<String, String> {
     let out = Command::new("git")
@@ -32,6 +34,57 @@ fn git_raw(folder: &str, args: &[&str]) -> Result<String, String> {
     } else {
         Err(String::from_utf8_lossy(&out.stderr).trim().to_string())
     }
+}
+
+// H5 (аудит 2026-06-17): валидатор относительного пути для чтения файла внутри репо.
+// `rel_path` приходит из IPC (фронт) → нельзя доверять: `../../.ssh/id_rsa` через
+// `git show HEAD:<путь>` или `folder.join(rel)` прочитал бы файл ВНЕ репозитория.
+// Гейт: пусто/абсолютный/«..»/«~» — отказ; затем канонизируем `folder.join(rel)` и
+// требуем, чтобы результат остался ВНУТРИ канонического `folder`. Симлинк, указывающий
+// наружу, канонизация разворачивает → выпадает за пределы → отказ. Возвращает Ok(())
+// только если путь безопасен.
+pub fn ensure_safe_rel_path(folder: &str, rel_path: &str) -> Result<(), String> {
+    let rel = rel_path.trim();
+    if rel.is_empty() {
+        return Err("пустой путь".into());
+    }
+    let p = Path::new(rel);
+    // абсолютный путь или начинается с '/' (или '\\' на всякий) — наружу из репо
+    if p.is_absolute() || rel.starts_with('/') || rel.starts_with('\\') {
+        return Err(format!("абсолютный путь запрещён: {rel}"));
+    }
+    // '~' раскрылся бы в $HOME — не относительный путь репо
+    if rel.starts_with('~') {
+        return Err(format!("путь с '~' запрещён: {rel}"));
+    }
+    // любой компонент пути == ".." (или родитель/корень) — выход за пределы дерева
+    use std::path::Component;
+    for comp in p.components() {
+        match comp {
+            Component::ParentDir => {
+                return Err(format!("выход за пределы дерева ('..') запрещён: {rel}"))
+            }
+            Component::RootDir | Component::Prefix(_) => {
+                return Err(format!("корневой/абсолютный компонент запрещён: {rel}"))
+            }
+            _ => {}
+        }
+    }
+    // Структурно безопасен. Если оба пути существуют — подтверждаем канонизацией, что
+    // итог реально внутри репо (ловит симлинк наружу). Если целевого файла ещё нет
+    // (новый/удалённый) — канонизация цели невозможна; структурной проверки выше
+    // (нет '..'/абсолюта) уже достаточно, не блокируем легитимный diff нового файла.
+    let base = match std::fs::canonicalize(folder) {
+        Ok(b) => b,
+        Err(_) => return Ok(()), // папки нет — пусть дальше упадёт штатно, не наша забота
+    };
+    let joined = Path::new(folder).join(rel);
+    if let Ok(canon) = std::fs::canonicalize(&joined) {
+        if !canon.starts_with(&base) {
+            return Err(format!("путь выходит за пределы репозитория: {rel}"));
+        }
+    }
+    Ok(())
 }
 
 pub fn is_repo(folder: &str) -> bool {
@@ -209,6 +262,16 @@ pub fn status(folder: &str) -> Vec<ChangedFile> {
 // новый файл). new_text = текущее содержимое с диска (пусто, если удалён).
 // status — из status() для этого пути (иначе «modified»).
 pub fn diff_file(folder: &str, rel_path: &str) -> DiffPair {
+    // H5: путь из IPC — сперва гейт против traversal (`../../.ssh/id_rsa`, абсолют, симлинк
+    // наружу). Небезопасный путь → не читаем ничего, отдаём пометку в diff (функция возвращает
+    // DiffPair, не Result; UI покажет текст вместо тихого чтения чужого файла).
+    if let Err(e) = ensure_safe_rel_path(folder, rel_path) {
+        return DiffPair {
+            old_text: String::new(),
+            new_text: format!("⟨отказано⟩ небезопасный путь: {e}"),
+            status: "error".to_string(),
+        };
+    }
     // git_raw (без trim!): сохраняем точные байты версии из HEAD, иначе срезанный
     // хвостовой \n даёт фантомную «изменённую» последнюю строку против диска.
     let old_text = git_raw(folder, &["show", &format!("HEAD:{}", rel_path)]).unwrap_or_default();
@@ -530,12 +593,35 @@ pub fn merge_undo(clone_of: &str, backup_sha: &str) -> Result<(), String> {
     Ok(())
 }
 
+// M3 (аудит 2026-06-17): advisory-lock на репозиторий-цель. Между merge_check «чисто» и
+// merge_apply другой параллельный перенос в ТУ ЖЕ цель мог бы изменить дерево → apply упал бы
+// частично. Сериализуем переносы по канонизированному пути `clone_of`: один Mutex на цель,
+// держим его на весь backup→apply. Минимальный scope — лочим только в merge_transfer (единая
+// точка записи), без вложенных захватов (нет дедлока). Реестр Mutex'ов растёт по числу разных
+// целей (их единицы — воркспейсы), не чистим.
+fn merge_lock_for(clone_of: &str) -> std::sync::Arc<Mutex<()>> {
+    static REGISTRY: OnceLock<Mutex<HashMap<String, std::sync::Arc<Mutex<()>>>>> = OnceLock::new();
+    // ключ = канонический путь (разные строки на один путь не разъедут блокировку)
+    let key = std::fs::canonicalize(clone_of)
+        .map(|p| p.to_string_lossy().to_string())
+        .unwrap_or_else(|_| clone_of.to_string());
+    let reg = REGISTRY.get_or_init(|| Mutex::new(HashMap::new()));
+    let mut map = reg.lock().unwrap_or_else(|e| e.into_inner());
+    map.entry(key)
+        .or_insert_with(|| std::sync::Arc::new(Mutex::new(())))
+        .clone()
+}
+
 // ЕДИНАЯ транзакционная точка переноса (все гейты ВНУТРИ — обойти нельзя): валидация цели →
 // построение патча → сухой прогон (конфликт → основное НЕ тронуто) → резервная точка (+ref от
 // gc) → применение (сбой → немедленный авто-откат). Возвращает MergeResult. Это рекомендованный
 // состязательной проверкой способ закрыть #1/#3/#7 (apply невозможно вызвать в обход гейтов).
 #[allow(dead_code)]
 pub fn merge_transfer(clone_of: &str, worktree: &str, paths: &[String]) -> MergeResult {
+    // M3: захватываем advisory-lock цели на весь перенос (backup→apply сериализованы).
+    // Держим guard до конца функции — параллельный merge в ту же цель ждёт здесь.
+    let lock = merge_lock_for(clone_of);
+    let _guard = lock.lock().unwrap_or_else(|e| e.into_inner());
     let fail = |msg: String| MergeResult {
         ok: false,
         applied_files: 0,
@@ -936,6 +1022,61 @@ mod tests {
             res.conflicts
         );
         assert_eq!(rd(&format!("{main}/doc.txt")), "MY OWN\n", "файл пользователя не затёрт");
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    // H5 (аудит 2026-06-17): diff_file ОБЯЗАН отказывать на traversal-путях, не читая чужой файл.
+    // '../x', абсолютный путь, '~' → status="error", старый текст пуст (никакого `git show` наружу).
+    #[test]
+    fn diff_file_rejects_path_traversal() {
+        let dir = scratch("traversal");
+        let (main, _wt) = setup_main_wt(&dir);
+
+        for bad in [
+            "../app.txt",
+            "../../etc/hosts",
+            "/etc/hosts",
+            "/Users/x/.ssh/id_rsa",
+            "sub/../../escape.txt",
+            "~/secret",
+        ] {
+            let pair = diff_file(&main, bad);
+            assert_eq!(pair.status, "error", "путь '{bad}' должен быть отклонён");
+            assert!(pair.old_text.is_empty(), "для '{bad}' ничего не читаем из HEAD");
+            assert!(
+                pair.new_text.contains("небезопасный путь"),
+                "для '{bad}' ожидали пометку об отказе, получили: {}",
+                pair.new_text
+            );
+        }
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    // Легитимный относительный путь по-прежнему работает (гейт не ломает нормальный diff).
+    #[test]
+    fn diff_file_allows_safe_relative_path() {
+        let dir = scratch("safe-rel");
+        let (main, _wt) = setup_main_wt(&dir);
+        fs::write(format!("{main}/app.txt"), "line1\nEDIT\nline3\n").unwrap();
+        let pair = diff_file(&main, "app.txt");
+        assert_ne!(pair.status, "error", "обычный путь не должен блокироваться");
+        assert_eq!(pair.old_text, "line1\nline2\nline3\n", "версия из HEAD прочитана");
+        assert_eq!(pair.new_text, "line1\nEDIT\nline3\n", "версия с диска прочитана");
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    // ensure_safe_rel_path — прямые юнит-кейсы (без git).
+    #[test]
+    fn ensure_safe_rel_path_unit() {
+        let dir = scratch("ensure-safe");
+        let d = dir.to_str().unwrap();
+        assert!(ensure_safe_rel_path(d, "a/b.txt").is_ok());
+        assert!(ensure_safe_rel_path(d, "deep/nested/file.rs").is_ok());
+        assert!(ensure_safe_rel_path(d, "").is_err(), "пусто");
+        assert!(ensure_safe_rel_path(d, "../x").is_err(), "..");
+        assert!(ensure_safe_rel_path(d, "a/../../x").is_err(), "вложенный ..");
+        assert!(ensure_safe_rel_path(d, "/abs").is_err(), "абсолют");
+        assert!(ensure_safe_rel_path(d, "~/x").is_err(), "тильда");
         let _ = fs::remove_dir_all(&dir);
     }
 

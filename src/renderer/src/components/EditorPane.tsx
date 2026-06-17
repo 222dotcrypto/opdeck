@@ -6,6 +6,7 @@ import * as monaco from 'monaco-editor'
 import EditorWorker from 'monaco-editor/esm/vs/editor/editor.worker?worker'
 import { marked } from 'marked'
 import { useStore, diffSourceFolder } from '../store'
+import './EditorPane.css'
 
 // Папка файла из POSIX-пути.
 function dirOf(p: string): string {
@@ -50,6 +51,68 @@ function hashText(s: string): number {
   let h = 5381
   for (let i = 0; i < s.length; i++) h = ((h << 5) + h + s.charCodeAt(i)) | 0
   return h
+}
+
+// RFC 0017 §Scope 5.4: построчный diff «было → стало» для change-bar в гаттере.
+// Без бэкенд-команды (Решение 3): считаем LCS по строкам из diffPair (old/new).
+// Возвращаем по НОМЕРАМ строк нового текста (1-based): какие добавлены/изменены, и
+// перед какими новыми строками стоит удаление (показываем красную полоску на этой строке).
+type LineKind = 'added' | 'modified' | 'deleted'
+function diffLineKinds(oldText: string, newText: string): Map<number, LineKind> {
+  const a = oldText.split('\n')
+  const b = newText.split('\n')
+  const n = a.length
+  const m = b.length
+  // Защитный потолок: LCS-таблица O(n×m) — для очень больших файлов отдаём пусто (нет
+  // полосок), вместо мегабайтных матриц и фриза. Реальные файлы у пилота скромные (Решение 4).
+  if (n > 4000 || m > 4000) return new Map<number, LineKind>()
+  // LCS-таблица (длины строк скромные у пилота — Решение 4, виртуализация отложена).
+  const lcs: number[][] = Array.from({ length: n + 1 }, () => new Array<number>(m + 1).fill(0))
+  for (let i = n - 1; i >= 0; i--) {
+    for (let j = m - 1; j >= 0; j--) {
+      lcs[i][j] = a[i] === b[j] ? lcs[i + 1][j + 1] + 1 : Math.max(lcs[i + 1][j], lcs[i][j + 1])
+    }
+  }
+  const kinds = new Map<number, LineKind>()
+  let i = 0
+  let j = 0
+  // pendingDelete — было удаление перед текущей позицией в новом тексте: если дальше идёт
+  // добавление, это «изменение» (modified) той же строки; если нет — «удаление» (метим
+  // полоской следующую существующую новую строку, или последнюю при удалении в конце).
+  let pendingDelete = false
+  while (i < n && j < m) {
+    if (a[i] === b[j]) {
+      if (pendingDelete) {
+        kinds.set(j + 1, 'deleted')
+        pendingDelete = false
+      }
+      i++
+      j++
+    } else if (lcs[i + 1][j] >= lcs[i][j + 1]) {
+      // строка из «было» исчезла → удаление
+      pendingDelete = true
+      i++
+    } else {
+      // строка из «стало» новая → добавление либо изменение (если перед ним было удаление)
+      kinds.set(j + 1, pendingDelete ? 'modified' : 'added')
+      pendingDelete = false
+      j++
+    }
+  }
+  while (i < n) {
+    pendingDelete = true
+    i++
+  }
+  while (j < m) {
+    kinds.set(j + 1, pendingDelete ? 'modified' : 'added')
+    pendingDelete = false
+    j++
+  }
+  if (pendingDelete) {
+    // удаление в самом конце файла — метим последнюю строку нового текста
+    kinds.set(Math.max(1, m), 'deleted')
+  }
+  return kinds
 }
 
 // Чёткие иконки развернуть/свернуть (диагональные стрелки), рисуем SVG — рендерятся одинаково везде.
@@ -143,6 +206,15 @@ export default function EditorPane({
   const [content, setContent] = useState('')
   const [dirty, setDirty] = useState(false)
   const [mode, setMode] = useState<'code' | 'preview' | 'browser' | 'diff'>('code')
+  // RFC 0017 §Scope 5.1: минимап выключен по умолчанию, тумблер в панели (runtime, без стора).
+  const [minimapOn, setMinimapOn] = useState(false)
+  // RFC 0017 §Scope 5.4: отдельная пара «было→стало» ТОЛЬКО для change-bar обычного редактора.
+  // Не переиспользуем diffPair, чтобы не зажечь кнопку Diff на неизменённых файлах.
+  const [cbPair, setCbPair] = useState<{ oldText: string; newText: string } | null>(null)
+  // живой инстанс monaco-редактора (обычный, не diff) — для change-bar (deltaDecorations).
+  const editorRef = useRef<monaco.editor.IStandaloneCodeEditor | null>(null)
+  // id текущих декораций change-bar — чтобы заменять их, а не плодить.
+  const decoIdsRef = useRef<string[]>([])
   // пара текстов diff «было → стало» (RFC 0011)
   const [diffPair, setDiffPair] = useState<{ oldText: string; newText: string } | null>(null)
   // адресная строка браузера. Внешний сайт → src напрямую; локальный файл — через
@@ -202,13 +274,36 @@ export default function EditorPane({
   // иначе diff застывает на состоянии момента открытия и не показывает свежие правки.
   const loadDiff = useCallback(async (): Promise<void> => {
     const f = fileRef.current
-    if (!f || !wsFolder) return
+    if (!f || !wsFolder) {
+      // M8: без папки-источника diff построить нельзя → явно гасим пару, иначе
+      // в редакторе остаётся прежний (устаревший) diff от другого файла.
+      setDiffPair(null)
+      return
+    }
     const rel = f.path.startsWith(wsFolder + '/') ? f.path.slice(wsFolder.length + 1) : f.path
     try {
       const pair = await window.api.git.diffFile(wsFolder, rel)
       setDiffPair({ oldText: pair.oldText, newText: pair.newText })
     } catch {
       setDiffPair({ oldText: '', newText: '' })
+    }
+  }, [wsFolder])
+
+  // RFC 0017 §Scope 5.4: подтянуть пару «было→стало» для change-bar обычного редактора.
+  // Неизменённый файл → old==new → нет декораций; новый файл → old=='' → все строки added.
+  // Ошибка/нет папки → гасим (декораций не будет). НЕ трогает diffPair (кнопку Diff).
+  const loadChangeBar = useCallback(async (): Promise<void> => {
+    const f = fileRef.current
+    if (!f || !wsFolder) {
+      setCbPair(null)
+      return
+    }
+    const rel = f.path.startsWith(wsFolder + '/') ? f.path.slice(wsFolder.length + 1) : f.path
+    try {
+      const pair = await window.api.git.diffFile(wsFolder, rel)
+      setCbPair({ oldText: pair.oldText, newText: pair.newText })
+    } catch {
+      setCbPair(null)
     }
   }, [wsFolder])
 
@@ -226,31 +321,85 @@ export default function EditorPane({
         return
       }
       setDiffPair(null)
-      window.api.fs.readFile(file.path).then((c) => {
-        setContent(c)
-        setDirty(false)
-      })
+      window.api.fs
+        .readFile(file.path)
+        .then((c) => {
+          setContent(c)
+          setDirty(false)
+        })
+        .catch((e) => {
+          // файл удалён / нет прав → не оставляем прошлый или пустой редактор молча
+          setContent('')
+          setDirty(false)
+          pushToast('error', 'Не удалось прочитать файл: ' + e)
+        })
       // md → превью, html → сразу в Браузер (видно отрисовку), остальное → редактор
       const lower = file.name.toLowerCase()
       if (lower.endsWith('.md')) setMode('preview')
       else if (lower.endsWith('.html') || lower.endsWith('.htm')) {
         setMode('browser')
         navigate(file.path)
-      } else setMode('code')
+      } else {
+        setMode('code')
+        // RFC 0017 §Scope 5.4: подтянуть пару для change-bar (отдельно от diffPair).
+        loadChangeBar()
+      }
     } else {
       setContent('')
       setDiffPair(null)
+      setCbPair(null)
       setDirty(false)
     }
+    // M8: wsFolder в зависимостях — если папка-источник появилась/исчезла позже
+    // (диф-файл уже открыт), эффект перезапустится: либо догрузит пару, либо погасит
+    // устаревший diff, вместо того чтобы залипнуть на старом.
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [file?.path, file?.diff])
+  }, [file?.path, file?.diff, wsFolder])
 
   // Живое обновление: список изменений обновился (правка на диске) → пока открыт Diff,
   // перечитываем пару, чтобы свежие правки сразу были видны.
   useEffect(() => {
     if (mode === 'diff' && fileRef.current?.diff) loadDiff()
+    // RFC 0017 §Scope 5.4: в обычном редакторе тоже перечитываем change-bar при правках.
+    else if (mode === 'code' && fileRef.current) loadChangeBar()
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [changedSig])
+
+  // RFC 0017 §Scope 5.4: применить change-bar к ОБЫЧНОМУ редактору (не diff).
+  // Считаем построчный diff из diffPair (было→стало) и красим левый край строки.
+  // Если пары нет (файл без git-изменений) — снимаем декорации.
+  const applyChangeBar = useCallback((): void => {
+    const ed = editorRef.current
+    if (!ed) return
+    const pair = cbPair
+    const decos: monaco.editor.IModelDeltaDecoration[] = []
+    // Полоски рисуем относительно «стало» из пары; число строк декорации не превышает
+    // число строк модели (modified/added привязаны к строкам нового текста).
+    if (pair && (pair.oldText !== '' || pair.newText !== '')) {
+      const kinds = diffLineKinds(pair.oldText, pair.newText)
+      for (const [line, kind] of kinds) {
+        decos.push({
+          range: new monaco.Range(line, 1, line, 1),
+          options: {
+            isWholeLine: true,
+            linesDecorationsClassName:
+              kind === 'added'
+                ? 'deck-cb-added'
+                : kind === 'deleted'
+                  ? 'deck-cb-deleted'
+                  : 'deck-cb-modified'
+          }
+        })
+      }
+    }
+    decoIdsRef.current = ed.deltaDecorations(decoIdsRef.current, decos)
+  }, [cbPair])
+
+  // Перерисовать change-bar когда поменялась пара, режим вернулся в редактор, или правят текст.
+  useEffect(() => {
+    if (mode === 'code') applyChangeBar()
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [cbPair, mode, content])
 
   const save = async (): Promise<void> => {
     const f = fileRef.current
@@ -260,6 +409,7 @@ export default function EditorPane({
       setDirty(false)
       pushToast('info', `Сохранено: ${f.name}`)
       loadDiff() // обновим пару «было→стало», чтобы Diff показал свежесохранённое
+      loadChangeBar() // RFC 0017 §Scope 5.4: и change-bar обычного редактора
     }
   }
 
@@ -313,10 +463,19 @@ export default function EditorPane({
               onClick={() => {
                 // из diff-режима контент мог быть не загружен — подтянем перед показом редактора
                 if (mode === 'diff' && file) {
-                  window.api.fs.readFile(file.path).then((c) => {
-                    setContent(c)
-                    setDirty(false)
-                  })
+                  window.api.fs
+                    .readFile(file.path)
+                    .then((c) => {
+                      setContent(c)
+                      setDirty(false)
+                    })
+                    .catch((e) => {
+                      // файл удалён / нет прав → не показываем устаревший diff-контент молча
+                      setContent('')
+                      setDirty(false)
+                      pushToast('error', 'Не удалось прочитать файл: ' + e)
+                    })
+                  loadChangeBar() // RFC 0017: вернулись в редактор → нарисовать change-bar
                 }
                 setMode('code')
               }}
@@ -345,6 +504,16 @@ export default function EditorPane({
             Браузер
           </button>
         </div>
+        {/* RFC 0017 §Scope 5.1: тумблер миникарты (по умолчанию выкл). Только в редакторе. */}
+        {file && mode === 'code' && (
+          <button
+            className={'editor-mini-btn' + (minimapOn ? ' on' : '')}
+            onClick={() => setMinimapOn((v) => !v)}
+            title="Миникарта (мини-обзор кода справа)"
+          >
+            Карта
+          </button>
+        )}
         {dirty && file && mode === 'code' && (
           <button className="save-btn sm" onClick={save} title="⌘S">
             Сохранить
@@ -435,11 +604,26 @@ export default function EditorPane({
             setDirty(true)
           }}
           onMount={(editor) => {
+            editorRef.current = editor
             editor.addCommand(monaco.KeyMod.CtrlCmd | monaco.KeyCode.KeyS, () => save())
+            // RFC 0017 §Scope 5.2: сворачивание кода хоткеями.
+            // Cmd+Alt+[ — свернуть всё, Cmd+Alt+] — развернуть всё.
+            editor.addCommand(
+              monaco.KeyMod.CtrlCmd | monaco.KeyMod.Alt | monaco.KeyCode.BracketLeft,
+              () => editor.getAction('editor.foldAll')?.run()
+            )
+            editor.addCommand(
+              monaco.KeyMod.CtrlCmd | monaco.KeyMod.Alt | monaco.KeyCode.BracketRight,
+              () => editor.getAction('editor.unfoldAll')?.run()
+            )
+            // change-bar при первом монтаже (пара уже могла загрузиться).
+            applyChangeBar()
           }}
           options={{
             fontSize: 12.5,
-            minimap: { enabled: false },
+            minimap: { enabled: minimapOn }, // RFC 0017 §Scope 5.1: тумблер миникарты
+            folding: true, // RFC 0017 §Scope 5.2: сворачивание (для foldAll/unfoldAll)
+            multiCursorModifier: 'alt', // RFC 0017 §Scope 5.3: Option+Click добавляет курсор
             scrollBeyondLastLine: false,
             lineNumbers: 'on',
             renderWhitespace: 'none',
@@ -452,6 +636,17 @@ export default function EditorPane({
             scrollbar: { verticalScrollbarSize: 9, horizontalScrollbarSize: 9, useShadows: false }
           }}
         />
+      )}
+      {/* RFC 0017 §Scope 5.2/5.3: тонкая подсказка по хоткеям — только в обычном редакторе. */}
+      {file && mode === 'code' && (
+        <div className="editor-hint">
+          <span>
+            <kbd>⌥</kbd>+клик — доп. курсор · <kbd>⌥⇧</kbd>+перетаскивание — курсоры столбцом
+          </span>
+          <span>
+            <kbd>⌘⌥[</kbd> свернуть всё · <kbd>⌘⌥]</kbd> развернуть
+          </span>
+        </div>
       )}
     </div>
   )

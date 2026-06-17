@@ -1,4 +1,6 @@
+import { useMemo } from 'react'
 import { create } from 'zustand'
+import { useShallow } from 'zustand/react/shallow'
 import type {
   Group,
   Workspace,
@@ -14,12 +16,13 @@ import type {
   AgentId,
   WorktreeStats,
   TestResult,
-  ChangedFile
+  ChangedFile,
+  BacklogTask
 } from '../../shared/types'
 import { GROUP_COLORS } from '../../shared/types'
 import { layoutDef } from './components/layouts'
 
-type Tab = 'workspace' | 'overview' | 'review' | 'settings'
+type Tab = 'workspace' | 'overview' | 'review' | 'backlog' | 'settings'
 
 // RFC 0013 Фаза 0: папка, ПРОТИВ которой считаем изменения/diff для воркспейса.
 // Если в фокусе сессия-КЛОН (своя ветка: задан cloneOf и cwd ≠ папке воркспейса) —
@@ -69,6 +72,7 @@ interface State {
   agents: Agent[]
   customAgents: CustomAgent[]
   presets: WorkspacePreset[]
+  tasks: BacklogTask[]
   activeWorkspaceId?: string
   tab: Tab
   selectedFile?: SelectedFile
@@ -86,6 +90,27 @@ interface State {
   sidebarCollapsed: boolean
   rightPanelVisible: boolean
 
+  // RFC 0017 X1: открыта ли командная палитра (Cmd+K). Только runtime — на диск не пишем.
+  commandPaletteOpen: boolean
+  // RFC 0017 X2: фильтр дерева файлов «показать только изменённые». UI-флаг как
+  // sidebarCollapsed/rightPanelVisible — только runtime (на диск не пишем), сбрасывается
+  // при перезапуске. Семантику включения держит сам FileTree.
+  fileTreeShowOnlyChanged: boolean
+  // RFC 0017 X4: лёгкий «хвост» вывода сессии для инспектора. Ключ = sessionId,
+  // значение = последние ~40 строк вывода (без ANSI). Только runtime — на диск НЕ пишем
+  // и НЕ персистим. Это ОТДЕЛЬНАЯ лёгкая подписка от живого терминала (TerminalPane),
+  // не вмешивается в его рендер. Кольцевой буфер: держим только последние строки.
+  sessionOutputTail: Record<string, string[]>
+
+  // H12/M6: функции-отписки от событий ядра (PTY/тесты/тосты/fs). Храним, чтобы
+  // повторный init() сначала снял старые подписки, а не плодил дубли-слушателей.
+  // Только runtime — на диск не пишем.
+  _unsubscribers: Array<() => void>
+  // M10: папки, для которых сейчас уже выполняется git.status (refreshChangedFiles).
+  // Защита от гонки: пока запрос в полёте, повторный дебаунс не запускает дубль.
+  // Только runtime.
+  _refreshingFolders: Set<string>
+
   init: () => Promise<void>
   persist: () => void
 
@@ -101,6 +126,10 @@ interface State {
   toggleGroup: (id: string) => void
   toggleSidebar: () => void
   toggleRightPanel: () => void
+  // RFC 0017 X1: открыть/закрыть командную палитру (Cmd+K).
+  setCommandPaletteOpen: (v: boolean) => void
+  // RFC 0017 X2: переключить фильтр дерева «только изменённые».
+  toggleFileTreeShowOnlyChanged: () => void
 
   createSession: (input: CreateSessionInput) => Promise<Session | null>
   splitSession: (afterId: string, dir: 'right' | 'down') => Promise<void>
@@ -138,20 +167,64 @@ interface State {
   removeCustomAgent: (id: string) => void
   savePreset: (name: string, layout: LayoutId, panels: { agentId: AgentId; clone: boolean }[]) => void
   deletePreset: (id: string) => void
+
+  // RFC 0016 — беклог задач
+  addTask: (partial?: Partial<BacklogTask>) => BacklogTask
+  updateTask: (id: string, patch: Partial<BacklogTask>) => void
+  deleteTask: (id: string) => void
+  // отправить задачу первым промтом в новую сессию выбранного агента/воркспейса
+  sendTaskToAgent: (taskId: string, agentId: AgentId, workspaceId: string) => Promise<void>
 }
 
 // RFC 0011: дебаунс рефреша списка изменений по событию fs:changed (правки сыплются
 // пачками — не дёргаем git status на каждый чих). Ключ — workspaceId.
 const changedDebounce: Record<string, ReturnType<typeof setTimeout>> = {}
 
+// RFC 0017 X4: сколько последних строк вывода держим в «хвосте» для инспектора.
+const SESSION_TAIL_LINES = 40
+
+// RFC 0017 X4: убрать ANSI-управляющие последовательности (цвет/курсор/очистка), чтобы
+// «хвост» в инспекторе читался как обычный текст. Лёгкая чистка — не полноценный парсер
+// терминала (живой терминал рисует xterm.js в TerminalPane, это отдельный текстовый срез):
+//  • CSI-последовательности  ESC[ … <буква>  (цвет, перемещение курсора и т.п.);
+//  • OSC-последовательности   ESC] … (BEL | ESC\)  (заголовок окна и пр.);
+//  • одиночные ESC + следующий символ;
+//  • \r без \n (возврат каретки от перерисовок TUI) убираем, чтобы строки не «слипались».
+// eslint-disable-next-line no-control-regex
+const ANSI_CSI = /\x1b\[[0-9;?]*[ -/]*[@-~]/g
+// eslint-disable-next-line no-control-regex
+const ANSI_OSC = /\x1b\][^\x07\x1b]*(?:\x07|\x1b\\)/g
+// eslint-disable-next-line no-control-regex
+const ANSI_ESC = /\x1b[@-Z\\-_]/g
+function stripAnsi(s: string): string {
+  return s
+    .replace(ANSI_OSC, '')
+    .replace(ANSI_CSI, '')
+    .replace(ANSI_ESC, '')
+    .replace(/\r(?!\n)/g, '')
+}
+
+// RFC 0017 X4: буфер накопления хвоста вывода. Копим очищенные куски ТУТ и сбрасываем в стор
+// ПАЧКОЙ раз в ~400мс (см. flushTails в init), а НЕ set() на каждый кусок — иначе при активной
+// сессии set() звался 100+/сек, стор дёргал всех подписчиков → главный поток забит → кнопки
+// лагают и клики теряются («надо нажать два раза»). Задержку хвоста инспектор терпит.
+const tailPending: Record<string, string> = {}
+let tailFlushTimer: ReturnType<typeof setTimeout> | null = null
+
 function persistable(s: State): PersistState {
   return {
     groups: s.groups,
     workspaces: s.workspaces,
-    sessions: s.sessions,
+    // H8: `stalled` и `alive` — runtime-флаги (watchdog/жив ли PTY), НЕ персистим.
+    // Бэкенд делает full-replace стейта, поэтому если бы stalled попал на диск, он
+    // мог бы «воскреснуть» при следующей загрузке. Чистим оба здесь, чтобы то, что
+    // сохранилось ≡ тому, что нарисуется после перезагрузки, а watchdog заново
+    // выставит stalled при реальном зацикливании.
+    sessions: s.sessions.map(({ stalled: _stalled, alive: _alive, ...rest }) => rest),
     settings: s.settings,
     customAgents: s.customAgents,
     presets: s.presets,
+    tasks: s.tasks,
     activeWorkspaceId: s.activeWorkspaceId
   }
 }
@@ -174,12 +247,18 @@ export const useStore = create<State>((set, get) => ({
   agents: [],
   customAgents: [],
   presets: [],
+  tasks: [],
   tab: 'workspace',
   toasts: [],
   sidebarCollapsed: false,
   rightPanelVisible: true,
+  commandPaletteOpen: false,
+  fileTreeShowOnlyChanged: false,
+  sessionOutputTail: {},
   selectedFileByWs: {},
   changedFiles: {},
+  _unsubscribers: [],
+  _refreshingFolders: new Set<string>(),
 
   init: async () => {
     try {
@@ -191,10 +270,13 @@ export const useStore = create<State>((set, get) => ({
         loaded: true,
         groups: state.groups,
         workspaces: state.workspaces,
-        sessions: state.sessions.map((s) => ({ ...s, alive: false })),
+        // H8: runtime-флаги сбрасываем на загрузке — процессы ещё не подняты (alive=false),
+        // зацикливания нет, пока watchdog не сообщит заново (stalled=false).
+        sessions: state.sessions.map((s) => ({ ...s, alive: false, stalled: false })),
         settings: state.settings,
         customAgents: state.customAgents ?? [],
         presets: state.presets ?? [],
+        tasks: state.tasks ?? [],
         activeWorkspaceId: state.activeWorkspaceId,
         agents
       })
@@ -204,40 +286,103 @@ export const useStore = create<State>((set, get) => ({
       set({ loaded: true })
       console.error('init failed:', e)
     }
+    // H12/M6: снимаем прежние подписки перед новыми (повторный init не плодит дубли
+    // слушателей — иначе одно событие ptyStatus прилетало бы во все накопленные).
+    // Для штатного единственного init() список пуст → поведение идентично прежнему.
+    get()._unsubscribers.forEach((u) => {
+      try {
+        u()
+      } catch {
+        /* отписка не должна валить init */
+      }
+    })
     // подписки на события PTY (в браузере без среды просто молча пропускаем)
     try {
-      window.api.on.ptyStatus((id, status) => get().setStatus(id, status))
-      window.api.on.ptyExit((id) =>
-        set((st) => ({
-          sessions: st.sessions.map((s) => (s.id === id ? { ...s, alive: false } : s))
-        }))
+      const unsubs: Array<() => void> = []
+      unsubs.push(window.api.on.ptyStatus((id, status) => get().setStatus(id, status)))
+      unsubs.push(
+        window.api.on.ptyExit((id) =>
+          set((st) => ({
+            sessions: st.sessions.map((s) => (s.id === id ? { ...s, alive: false } : s))
+          }))
+        )
       )
       // RFC 0012 watchdog: агент завис/зациклился → флаг на сессии (⚠ + кнопка ↻)
-      window.api.on.ptyStalled((id, stalled) =>
-        set((st) => ({
-          sessions: st.sessions.map((s) => (s.id === id ? { ...s, stalled } : s))
-        }))
+      unsubs.push(
+        window.api.on.ptyStalled((id, stalled) =>
+          set((st) => ({
+            sessions: st.sessions.map((s) => (s.id === id ? { ...s, stalled } : s))
+          }))
+        )
       )
       // RFC 0014 Фаза 2: результат прогона тестов → в стор + тост по завершении
-      window.api.on.testResult((r) => {
-        set((st) => ({ testResults: { ...st.testResults, [r.cwd]: r } }))
-        if (!r.running) {
-          if (r.error) get().pushToast('error', `Тесты: ${r.error}`)
-          else if (r.ok) get().pushToast('info', `✅ Тесты прошли (${r.command})`)
-          else get().pushToast('error', `❌ Тесты упали (код ${r.code ?? '?'}, ${r.command})`)
-        }
-      })
-      window.api.on.toast((kind, text) => get().pushToast(kind, text))
+      unsubs.push(
+        window.api.on.testResult((r) => {
+          set((st) => ({ testResults: { ...st.testResults, [r.cwd]: r } }))
+          if (!r.running) {
+            if (r.error) get().pushToast('error', `Тесты: ${r.error}`)
+            else if (r.ok) get().pushToast('info', `✅ Тесты прошли (${r.command})`)
+            else get().pushToast('error', `❌ Тесты упали (код ${r.code ?? '?'}, ${r.command})`)
+          }
+        })
+      )
+      unsubs.push(window.api.on.toast((kind, text) => get().pushToast(kind, text)))
       // авто-переименование шелл-сессии, когда в ней запустили CLI (split → claude и т.п.)
-      window.api.on.cliDetected((id, agentId, name) => get().applyDetectedCli(id, agentId, name))
+      unsubs.push(
+        window.api.on.cliDetected((id, agentId, name) => get().applyDetectedCli(id, agentId, name))
+      )
       // RFC 0011: в папке воркспейса что-то изменилось → обновить список «Изменения»
       // (дебаунс ~400мс, чтобы не дёргать git status на каждую правку файла).
-      window.api.on.fsChanged((root) => {
-        const ws = get().workspaces.find((w) => w.folder === root)
-        if (!ws) return
-        clearTimeout(changedDebounce[ws.id])
-        changedDebounce[ws.id] = setTimeout(() => get().refreshChangedFiles(ws.id), 400)
-      })
+      unsubs.push(
+        window.api.on.fsChanged((root) => {
+          // L3: воркспейс мог быть удалён, пока сыпались fs-события — не планируем для него рефреш
+          const ws = get().workspaces.find((w) => w.folder === root)
+          if (!ws) return
+          clearTimeout(changedDebounce[ws.id])
+          changedDebounce[ws.id] = setTimeout(() => get().refreshChangedFiles(ws.id), 400)
+        })
+      )
+      // RFC 0017 X4: лёгкий «хвост» вывода для инспектора сессии. ОТДЕЛЬНАЯ подписка от
+      // живого терминала (TerminalPane) — она НЕ трогает рендер xterm.js, лишь копит
+      // последние ~40 строк текста на сессию (ANSI вычищен) в кольцевой буфер.
+      // Сброс накопленного хвоста в стор ПАЧКОЙ (раз в ~400мс) — не на каждый кусок вывода.
+      const flushTails = (): void => {
+        const ids = Object.keys(tailPending)
+        if (ids.length === 0) return
+        // снимок + очистка буфера атомарны (JS однопоточный) — новые куски пойдут в новый цикл
+        const snap: Record<string, string> = {}
+        for (const id of ids) {
+          snap[id] = tailPending[id]
+          delete tailPending[id]
+        }
+        set((st) => {
+          const tail = { ...st.sessionOutputTail }
+          for (const id of ids) {
+            const prev = tail[id] ?? []
+            // Куски нарезаны как угодно: дописываем к последней строке, затем режем по \n —
+            // строки не дробятся на границах кусков.
+            const merged = (prev.length ? prev[prev.length - 1] : '') + snap[id]
+            const head = prev.slice(0, -1)
+            const lines = merged.split('\n')
+            tail[id] = [...head, ...lines].slice(-SESSION_TAIL_LINES)
+          }
+          return { sessionOutputTail: tail }
+        })
+      }
+      unsubs.push(
+        window.api.on.ptyData((id, data) => {
+          const clean = stripAnsi(data)
+          if (!clean) return
+          tailPending[id] = (tailPending[id] ?? '') + clean
+          if (tailFlushTimer === null) {
+            tailFlushTimer = setTimeout(() => {
+              tailFlushTimer = null
+              flushTails()
+            }, 400)
+          }
+        })
+      )
+      set({ _unsubscribers: unsubs })
     } catch (e) {
       console.error('subscribe failed:', e)
     }
@@ -287,13 +432,23 @@ export const useStore = create<State>((set, get) => ({
   deleteWorkspace: (id) => {
     const ws = get().workspaces.find((w) => w.id === id)
     ws?.sessionIds.forEach((sid) => window.api.pty.kill(sid))
-    set((s) => ({
-      workspaces: s.workspaces.filter((w) => w.id !== id),
-      // Группу НЕ удаляем, даже если она опустела — чтобы можно было снова добавить в неё
-      // воркспейс (пустая группа остаётся в сайдбаре с кнопкой «＋»). Удаляется только вручную.
-      sessions: s.sessions.filter((x) => x.workspaceId !== id),
-      activeWorkspaceId: s.activeWorkspaceId === id ? undefined : s.activeWorkspaceId
-    }))
+    // L3: гасим висящий дебаунс-таймер git-status этого воркспейса и убираем ключ,
+    // иначе он отработает уже по удалённому id (и map таймеров растёт без чистки).
+    clearTimeout(changedDebounce[id])
+    delete changedDebounce[id]
+    set((s) => {
+      // чистим хвосты вывода сессий удаляемого воркспейса (иначе sessionOutputTail растёт)
+      const tail = { ...s.sessionOutputTail }
+      ws?.sessionIds.forEach((sid) => delete tail[sid])
+      return {
+        workspaces: s.workspaces.filter((w) => w.id !== id),
+        // Группу НЕ удаляем, даже если она опустела — чтобы можно было снова добавить в неё
+        // воркспейс (пустая группа остаётся в сайдбаре с кнопкой «＋»). Удаляется только вручную.
+        sessions: s.sessions.filter((x) => x.workspaceId !== id),
+        activeWorkspaceId: s.activeWorkspaceId === id ? undefined : s.activeWorkspaceId,
+        sessionOutputTail: tail
+      }
+    })
     get().persist()
   },
 
@@ -322,13 +477,15 @@ export const useStore = create<State>((set, get) => ({
     // восстанавливаем превью, открытое в этом воркспейсе ранее
     set((s) => ({ activeWorkspaceId: id, tab: 'workspace', selectedFile: s.selectedFileByWs[id] }))
     // запускаем PTY для сессий воркспейса, если ещё не живы
-    const st = get()
-    const ws = st.workspaces.find((w) => w.id === id)
+    const ws = get().workspaces.find((w) => w.id === id)
     ws?.sessionIds.forEach(async (sid) => {
-      const s = st.sessions.find((x) => x.id === sid)
+      // M7: читаем СВЕЖИЙ снимок (а не закэшированный до await) — между стартами
+      // другая операция могла поменять список сессий; работаем на текущем стейте.
+      const s = get().sessions.find((x) => x.id === sid)
       if (s && !(await window.api.session.isAlive(sid))) {
         await window.api.session.start(s)
         set((cur) => ({
+          // если сессию успели удалить, пока стартовали — map просто её не найдёт
           sessions: cur.sessions.map((x) => (x.id === sid ? { ...x, alive: true } : x))
         }))
       }
@@ -345,6 +502,12 @@ export const useStore = create<State>((set, get) => ({
 
   toggleSidebar: () => set((s) => ({ sidebarCollapsed: !s.sidebarCollapsed })),
   toggleRightPanel: () => set((s) => ({ rightPanelVisible: !s.rightPanelVisible })),
+
+  // RFC 0017 X1: открыть/закрыть командную палитру (runtime, не персистим).
+  setCommandPaletteOpen: (v) => set({ commandPaletteOpen: v }),
+  // RFC 0017 X2: фильтр дерева «только изменённые» (runtime, как панели — не персистим).
+  toggleFileTreeShowOnlyChanged: () =>
+    set((s) => ({ fileTreeShowOnlyChanged: !s.fileTreeShowOnlyChanged })),
 
   createSession: async (input) => {
     try {
@@ -403,13 +566,18 @@ export const useStore = create<State>((set, get) => ({
 
   removeSession: (id) => {
     window.api.pty.kill(id)
-    set((s) => ({
-      sessions: s.sessions.filter((x) => x.id !== id),
-      workspaces: s.workspaces.map((w) => ({
-        ...w,
-        sessionIds: w.sessionIds.filter((sid) => sid !== id)
-      }))
-    }))
+    set((s) => {
+      // чистим хвост вывода удалённой сессии — иначе sessionOutputTail растёт вечно
+      const { [id]: _drop, ...tail } = s.sessionOutputTail
+      return {
+        sessions: s.sessions.filter((x) => x.id !== id),
+        workspaces: s.workspaces.map((w) => ({
+          ...w,
+          sessionIds: w.sessionIds.filter((sid) => sid !== id)
+        })),
+        sessionOutputTail: tail
+      }
+    })
     get().persist()
   },
 
@@ -561,11 +729,18 @@ export const useStore = create<State>((set, get) => ({
       set((s) => ({ changedFiles: { ...s.changedFiles, [workspaceId]: [] } }))
       return
     }
+    // M10: если git.status по этой папке уже в полёте — не запускаем дубль (дебаунс мог
+    // выстрелить повторно, пока запрос ещё считается). Свежее состояние всё равно
+    // подтянет следующий тик дебаунса/смена фокуса.
+    if (st._refreshingFolders.has(folder)) return
+    st._refreshingFolders.add(folder)
     try {
       const files = await window.api.git.status(folder)
       set((s) => ({ changedFiles: { ...s.changedFiles, [workspaceId]: files } }))
     } catch {
       /* нет ядра (браузер без Tauri) — молча пропускаем */
+    } finally {
+      get()._refreshingFolders.delete(folder)
     }
   },
   setFocused: (id) => {
@@ -655,5 +830,206 @@ export const useStore = create<State>((set, get) => ({
   deletePreset: (id) => {
     set((s) => ({ presets: s.presets.filter((p) => p.id !== id) }))
     get().persist()
+  },
+
+  // RFC 0016 — беклог: добавить задачу (дефолт — черновик-идея, пустые поля).
+  addTask: (partial) => {
+    const task: BacklogTask = {
+      id: crypto.randomUUID(),
+      title: partial?.title ?? '',
+      description: partial?.description ?? '',
+      kind: partial?.kind ?? 'idea',
+      attachments: partial?.attachments ?? [],
+      status: partial?.status ?? 'draft',
+      createdAt: partial?.createdAt ?? new Date().toISOString(),
+      sentSessionId: partial?.sentSessionId
+    }
+    set((s) => ({ tasks: [task, ...s.tasks] }))
+    get().persist()
+    return task
+  },
+
+  updateTask: (id, patch) => {
+    set((s) => ({ tasks: s.tasks.map((t) => (t.id === id ? { ...t, ...patch } : t)) }))
+    get().persist()
+  },
+
+  deleteTask: (id) => {
+    set((s) => ({ tasks: s.tasks.filter((t) => t.id !== id) }))
+    get().persist()
+  },
+
+  // RFC 0016 «В работу»: текст задачи (+пути скринов) → первым промтом в новую сессию
+  // выбранного агента/воркспейса. Переиспользуем готовый createSession (та же дорога,
+  // что у AddSessionForm). Помечаем задачу sent + храним sentSessionId (аудит, разовая
+  // отправка). Переключаемся в воркспейс и фокусируем новую сессию — пилот сразу видит её.
+  sendTaskToAgent: async (taskId, agentId, workspaceId) => {
+    const st = get()
+    const task = st.tasks.find((t) => t.id === taskId)
+    if (!task) return
+    const ws = st.workspaces.find((w) => w.id === workspaceId)
+    if (!ws) {
+      st.pushToast('error', 'Воркспейс не найден')
+      return
+    }
+    const firstPrompt =
+      task.title +
+      (task.description ? '\n\n' + task.description : '') +
+      (task.attachments.length ? '\n\nСкриншоты: ' + task.attachments.join(', ') : '')
+    const session = await st.createSession({
+      workspaceId,
+      agentId,
+      cwd: ws.folder || undefined,
+      firstPrompt: firstPrompt.trim() || undefined
+    })
+    if (!session) return // createSession уже показал тост об ошибке
+    // помечаем задачу отправленной + запоминаем сессию
+    set((s) => ({
+      tasks: s.tasks.map((t) =>
+        t.id === taskId ? { ...t, status: 'sent' as const, sentSessionId: session.id } : t
+      )
+    }))
+    get().persist()
+    // показываем результат: открываем воркспейс и фокусируем новую сессию
+    st.setActiveWorkspace(workspaceId)
+    st.setFocused(session.id)
+    st.setTab('workspace')
+    st.pushToast('info', `Задача отправлена агенту: ${task.title || 'без названия'}`)
   }
 }))
+
+// ── Перф-селекторы (узкая подписка на стор) ─────────────────────────────────
+// Проблема: компоненты, подписанные на весь `s.sessions`, перерисовываются при
+// ЛЮБОЙ смене статуса любой сессии (setStatus каждый раз создаёт новый массив).
+// Эти хелперы дают узкий срез + сравнение по содержимому (useShallow): пока сам
+// срез не изменился по значению — re-render не происходит, но КАК ТОЛЬКО статус
+// нужной сессии меняется, срез меняется и подписчик честно перерисовывается
+// (реактивность не теряется). Подключение на конкретных call-site'ах — за их
+// владельцами; здесь только инструмент, существующие ключи стора не переименованы.
+
+// Одна сессия по id (или undefined). Меняется → перерисовка только этого подписчика.
+export const useSession = (id: string | undefined): Session | undefined =>
+  useStore((s) => (id ? s.sessions.find((x) => x.id === id) : undefined))
+
+// Только статус одной сессии — самый частый источник перерисовок (рамка/значок).
+export const useSessionStatus = (id: string | undefined): SessionStatus | undefined =>
+  useStore((s) => (id ? s.sessions.find((x) => x.id === id)?.status : undefined))
+
+// Флаг зацикливания (watchdog) одной сессии — для ⚠ + кнопки ↻ без подписки на массив.
+export const useSessionStalled = (id: string | undefined): boolean =>
+  useStore((s) => (id ? (s.sessions.find((x) => x.id === id)?.stalled ?? false) : false))
+
+// Сессии одного воркспейса (по содержимому). Стабильна, пока не изменился именно
+// этот срез — смена сессии чужого воркспейса не перерисует подписчика.
+export const useWorkspaceSessions = (workspaceId: string | undefined): Session[] =>
+  useStore(
+    useShallow((s) =>
+      workspaceId ? s.sessions.filter((x) => x.workspaceId === workspaceId) : []
+    )
+  )
+
+// Лёгкая выжимка статусов воркспейса (id+status) для сайдбара/обзора — не тянет
+// весь объект сессии, перерисовка только когда меняется набор/статусы среза.
+export const useWorkspaceStatuses = (
+  workspaceId: string | undefined
+): Array<{ id: string; status: SessionStatus }> =>
+  useStore(
+    useShallow((s) =>
+      workspaceId
+        ? s.sessions
+            .filter((x) => x.workspaceId === workspaceId)
+            .map((x) => ({ id: x.id, status: x.status }))
+        : []
+    )
+  )
+
+// ── RFC 0017 X4: «хвост» вывода сессии для инспектора ───────────────────────
+// Последние ~40 строк вывода одной сессии (ANSI вычищен). Узкая подписка: меняется
+// только когда пришёл новый вывод именно этой сессии. Пустой массив, если вывода ещё нет.
+export const useSessionTail = (id: string | undefined): string[] =>
+  useStore(useShallow((s) => (id ? (s.sessionOutputTail[id] ?? []) : [])))
+
+// ── RFC 0017 X2/X3/X4: общий селектор конфликтов «две сессии правят один файл» ──
+// Единый источник истины для пометки конфликтов (вынесено из Review.tsx, семантика
+// идентична). Ключ конфликта = base + '::' + относительный путь файла, где base —
+// cloneOf для сессии-клона (своя ветка), иначе папка воркспейса (= база ключа в Review).
+// Если по одному ключу правят ≥2 ЖИВЫХ дерева (юнита) — это конфликт.
+//
+// • conflictKeys — Set ключей-конфликтов (FileTree X2: пометить файл ⚠).
+// • editorsByKey — Map ключ → список id сессий, правящих этот файл (SessionInspector X4:
+//   «кто ещё правит этот файл»; Review X3: подсветка/предупреждение).
+//
+// Источник git-статусов — store.changedFiles[workspaceId] (наполняется refreshChangedFiles
+// по папке-источнику diffSourceFolder того воркспейса). Важно: changedFiles[ws.id] держит
+// изменения РОВНО ОДНОГО дерева — фокус-сессии-клона, если она в фокусе этого воркспейса,
+// иначе основной папки воркспейса (см. diffSourceFolder). Поэтому файлы относим к ТОМУ
+// дереву, что реально отражено в changedFiles (без ложных «правит всё подряд» по всем
+// клонам сразу). Конфликт по одному base-ключу всё равно проявится, когда два разных
+// дерева делят одну базу (напр. клон с cloneOf == папке другого воркспейса, или два
+// воркспейса на одной папке) — ровно как в Review, где такие юниты считаются вместе.
+export interface ConflictInfo {
+  conflictKeys: Set<string>
+  editorsByKey: Map<string, string[]>
+}
+
+// Сырьё для расчёта конфликтов: только структурные поля сессий (id/ws/clone/cwd/folder),
+// фокус и git-изменения. Узкая подписка (useShallow по строке-подписи) — пересчёт ТОЛЬКО
+// когда реально меняется состав/изменения, не на каждый статус-тик. Set/Map нельзя сравнить
+// shallow по содержимому, поэтому строим их в useMemo по этой стабильной подписи (как Review
+// мемоизирует units/conflictKeys), а не возвращаем новые Set/Map на каждый рендер.
+function conflictSignature(s: State): string {
+  const sess = s.sessions
+    .map((x) => `${x.id}|${x.workspaceId}|${x.cloneOf ?? ''}|${x.cwd}`)
+    .join(';')
+  const ws = s.workspaces.map((w) => `${w.id}|${w.folder}`).join(';')
+  const chg = s.workspaces
+    .map((w) => w.id + '#' + (s.changedFiles[w.id] ?? []).map((f) => f.path).join(','))
+    .join(';')
+  return `${sess}##${ws}##${chg}##${s.focusedSessionId ?? ''}`
+}
+
+export function useConflictInfo(): ConflictInfo {
+  // Подписываемся ТОЛЬКО на строку-подпись (примитив) — компонент перерисуется лишь когда
+  // меняется состав сессий/папок/изменений/фокуса, а НЕ на каждый статус-тик. Само сырьё
+  // читаем из getState() внутри useMemo (на момент пересчёта оно консистентно с подписью).
+  const sig = useStore(conflictSignature)
+  return useMemo<ConflictInfo>(() => {
+    const { sessions, workspaces, changedFiles, focusedSessionId } = useStore.getState()
+    // ключ конфликта → набор id сессий, правящих этот файл (Set для дедупа сессий)
+    const editors = new Map<string, Set<string>>()
+    workspaces.forEach((ws) => {
+      const wsSessions = sessions.filter((x) => x.workspaceId === ws.id)
+      if (wsSessions.length === 0) return
+      const files = changedFiles[ws.id] ?? []
+      if (files.length === 0) return
+      const isClone = (x: Session): boolean => !!(x.cloneOf && x.cwd && x.cwd !== ws.folder)
+      // Какое дерево отражено в changedFiles[ws.id]: фокус-сессия-клон этого воркспейса
+      // (если она в фокусе) — иначе основное дерево воркспейса. Это та же развилка, что
+      // в diffSourceFolder, по которой refreshChangedFiles и собрал эти файлы.
+      const focused = wsSessions.find((x) => x.id === focusedSessionId)
+      const focusIsClone = !!focused && isClone(focused)
+      // base ключа (как в Review) + список сессий, делящих это дерево
+      const base = focusIsClone ? (focused!.cloneOf ?? focused!.cwd) : ws.folder
+      const treeSessions = focusIsClone
+        ? [focused!.id]
+        : wsSessions.filter((x) => !isClone(x)).map((x) => x.id)
+      if (treeSessions.length === 0) return
+      files.forEach((f) => {
+        const k = base + '::' + f.path
+        let set = editors.get(k)
+        if (!set) editors.set(k, (set = new Set<string>()))
+        treeSessions.forEach((id) => set!.add(id))
+      })
+    })
+    const conflictKeys = new Set<string>()
+    const editorsByKey = new Map<string, string[]>()
+    editors.forEach((set, k) => {
+      const ids = Array.from(set)
+      editorsByKey.set(k, ids)
+      if (ids.length >= 2) conflictKeys.add(k)
+    })
+    return { conflictKeys, editorsByKey }
+    // sig — стабильная подпись всех входов; sessions/workspaces/changedFiles читаются внутри.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [sig])
+}

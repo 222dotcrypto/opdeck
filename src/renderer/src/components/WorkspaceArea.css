@@ -1,0 +1,32 @@
+/* RFC 0017 X4 — табы правой панели «Файлы | Инспектор». Co-located стили (Vite
+   соберёт), общий index.css не трогаем. Цвета — из существующих токенов. */
+
+.rp-tabs {
+  display: flex;
+  gap: 2px;
+}
+.rp-tab {
+  background: transparent;
+  border: none;
+  padding: 2px 8px;
+  font-size: 10.5px;
+  letter-spacing: 1px;
+  color: var(--text-3);
+  cursor: pointer;
+  border-radius: 4px;
+}
+.rp-tab:hover {
+  color: var(--text-2);
+}
+.rp-tab.on {
+  color: var(--text);
+  background: var(--bg-3);
+}
+
+/* Контейнер вкладки «Инспектор» внутри rp-files (заполняет высоту панели). */
+.rp-inspector {
+  flex: 1;
+  min-height: 0;
+  display: flex;
+  flex-direction: column;
+}

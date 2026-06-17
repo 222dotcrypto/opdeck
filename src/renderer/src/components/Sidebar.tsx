@@ -1,8 +1,8 @@
-import { useState } from 'react'
+import { useMemo, useState } from 'react'
 import { useStore } from '../store'
 import EditableName from './EditableName'
 import Logo from './Logo'
-import type { Workspace } from '../../../shared/types'
+import type { SessionStatus, Workspace } from '../../../shared/types'
 
 function shortPath(p: string): string {
   return p.replace(/^\/Users\/[^/]+/, '~')
@@ -31,6 +31,36 @@ export default function Sidebar({ onNew }: { onNew: (groupName?: string) => void
   const [confirmAction, setConfirmAction] = useState<{ msg: string; onYes: () => void } | null>(null)
 
   const ungrouped = workspaces.filter((w) => !w.groupId)
+
+  // Карта «id сессии → статус» строится ОДИН раз за рендер (а не .find() по всему
+  // массиву на каждую сессию каждого воркспейса). Зависит только от sessions —
+  // смена статуса одной сессии пересоздаёт массив и карту, и это правильно:
+  // счётчики обязаны обновиться. Но тяжёлый O(сессии×воркспейсы) поиск ушёл.
+  const statusById = useMemo(() => {
+    const m = new Map<string, SessionStatus>()
+    sessions.forEach((s) => m.set(s.id, s.status))
+    return m
+  }, [sessions])
+
+  // Счётчики по статусам на воркспейс. Пересчитываются только когда меняется
+  // карта статусов или состав сессий воркспейса. Ключ — id воркспейса.
+  const countsByWs = useMemo(() => {
+    const m = new Map<string, { working: number; awaiting: number; done: number }>()
+    workspaces.forEach((w) => {
+      let working = 0
+      let awaiting = 0
+      let done = 0
+      w.sessionIds.forEach((id) => {
+        // жёлтый — ждёт, синий — работает, зелёный — закончила. «idle» не показываем.
+        const st = statusById.get(id)
+        if (st === 'working') working++
+        else if (st === 'awaiting') awaiting++
+        else if (st === 'ready') done++
+      })
+      m.set(w.id, { working, awaiting, done })
+    })
+    return m
+  }, [workspaces, statusById])
 
   const startWsDrag = (e: React.MouseEvent, w: Workspace): void => {
     if (e.button !== 0) return
@@ -76,17 +106,12 @@ export default function Sidebar({ onNew }: { onNew: (groupName?: string) => void
   }
 
   const renderWs = (w: Workspace): JSX.Element => {
-    // считаем сессии по статусу: жёлтый — ждёт, синий — работает, зелёный — закончила.
-    // «idle» (просто стоит) не показываем.
-    let working = 0
-    let awaiting = 0
-    let done = 0
-    w.sessionIds.forEach((id) => {
-      const st = sessions.find((s) => s.id === id)?.status
-      if (st === 'working') working++
-      else if (st === 'awaiting') awaiting++
-      else if (st === 'ready') done++
-    })
+    // счётчики уже посчитаны в countsByWs (мемоизированы) — здесь только читаем.
+    const { working, awaiting, done } = countsByWs.get(w.id) ?? {
+      working: 0,
+      awaiting: 0,
+      done: 0
+    }
     return (
       <div
         key={w.id}

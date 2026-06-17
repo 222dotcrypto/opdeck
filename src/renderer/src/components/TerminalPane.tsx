@@ -118,9 +118,17 @@ function TerminalPane({
         st.setDragOver(tid && tid !== session.id ? tid : undefined)
       }
     }
-    const onUp = (ev: MouseEvent): void => {
+    // Снятие слушателей делаем в ОДНОМ месте и гарантированно: даже если порог
+    // перетаскивания не пройден (обычный клик) или mouseup прилетел за окном.
+    // mouseup вешаем с { once: true } — он сам отпишется после первого срабатывания,
+    // а mousemove снимаем тут явно. Это исключает накопление «висячих» слушателей
+    // при быстрых кликах без реального drag (H10).
+    const cleanup = (): void => {
       document.removeEventListener('mousemove', onMove)
       document.removeEventListener('mouseup', onUp)
+    }
+    const onUp = (ev: MouseEvent): void => {
+      cleanup()
       document.body.style.cursor = ''
       if (dragging) {
         const el = (document.elementFromPoint(ev.clientX, ev.clientY) as HTMLElement | null)?.closest(
@@ -133,7 +141,7 @@ function TerminalPane({
       st.setDragOver(undefined)
     }
     document.addEventListener('mousemove', onMove)
-    document.addEventListener('mouseup', onUp)
+    document.addEventListener('mouseup', onUp, { once: true })
   }
 
   useEffect(() => {
@@ -231,17 +239,32 @@ function TerminalPane({
     // склейка вывода из RFC 0006. Очередь ограничена — на случай долгого скрытия (память
     // и длительность одного батча не растут; терминал всё равно режет скроллбэк).
     const MAX_QUEUE = 400_000
-    let writeQueue = ''
+    // Куски копим в МАССИВ и склеиваем один раз на флаше (join), а не конкатенацией
+    // строки на каждый чанк: при буре 100+ чанков/сек это убирает повторный
+    // O(длина) пересбор строки + slice на каждый чанк. queueLen считаем дёшево
+    // (без построения строки), обрезку переполнения делаем тоже на флаше — там, где
+    // строка и так собирается. Вывод НЕ теряем: режем только самое старое при
+    // выходе за MAX_QUEUE (терминал всё равно ограничивает скроллбэк).
+    let writeChunks: string[] = []
+    let queueLen = 0
     let flushRaf = 0
     const flush = (): void => {
       flushRaf = 0
-      if (!writeQueue) return
-      term.write(writeQueue)
-      writeQueue = ''
+      if (!writeChunks.length) return
+      let out = writeChunks.join('')
+      writeChunks = []
+      queueLen = 0
+      if (out.length > MAX_QUEUE) out = out.slice(-MAX_QUEUE)
+      term.write(out)
     }
     const queueWrite = (data: string): void => {
-      writeQueue += data
-      if (writeQueue.length > MAX_QUEUE) writeQueue = writeQueue.slice(-MAX_QUEUE)
+      writeChunks.push(data)
+      queueLen += data.length
+      // Предохранитель на случай долгого скрытия окна, пока rAF не тикает: не даём
+      // массиву расти бесконечно — выкидываем самые старые куски сверх лимита.
+      while (queueLen > MAX_QUEUE && writeChunks.length > 1) {
+        queueLen -= writeChunks.shift()!.length
+      }
       if (!flushRaf) flushRaf = requestAnimationFrame(flush)
     }
 

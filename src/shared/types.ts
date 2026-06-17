@@ -112,6 +112,22 @@ export interface Settings {
   codexSandbox?: string
 }
 
+// RFC 0016 — задача беклога. Тег (kind) и цикл (status) предопределены.
+// attachments — пути к файлам-скринам (save_image_bytes), не base64.
+export type BacklogKind = 'bug' | 'idea' | 'feature'
+export type BacklogStatus = 'draft' | 'sent' | 'done'
+
+export interface BacklogTask {
+  id: string
+  title: string
+  description: string
+  kind: BacklogKind
+  attachments: string[] // абсолютные пути к файлам-скринам
+  status: BacklogStatus
+  createdAt: string // ISO-строка
+  sentSessionId?: string // RFC 0016: какой сессии отдали (аудит, разовая отправка)
+}
+
 export interface PersistState {
   groups: Group[]
   workspaces: Workspace[]
@@ -119,6 +135,7 @@ export interface PersistState {
   settings: Settings
   customAgents: CustomAgent[]
   presets: WorkspacePreset[]
+  tasks?: BacklogTask[] // RFC 0016 — беклог задач
   activeWorkspaceId?: string
 }
 

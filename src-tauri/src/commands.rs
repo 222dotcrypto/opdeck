@@ -36,13 +36,18 @@ pub fn state_get(store: State<'_, Mutex<StateStore>>) -> PersistState {
 #[tauri::command]
 pub fn state_save(store: State<'_, Mutex<StateStore>>, mut state: PersistState) -> bool {
     let mut s = store.lock().unwrap();
-    // RFC 0007: resume_id — backend-owned (пишется хуком, фронт его не знает). Фронт делает
-    // full-replace стейта → затёр бы resume_id. Сохраняем существующий, если входящий пуст
-    // (паттерн guard против full-replace, как favorites/blacklist в useful-v4).
+    // RFC 0007 / H9 (аудит 2026-06-17): backend-owned поля сессии (resume_id + transcript_path)
+    // пишутся хуком — фронт их не знает и при full-replace стейта затёр бы. Сохраняем существующее
+    // значение, если входящее пусто (паттерн guard против full-replace, как favorites/blacklist
+    // в useful-v4). Любое НОВОЕ backend-owned поле сессии добавлять в этот же цикл, иначе будет
+    // молча теряться на каждом persist фронта.
     for incoming in state.sessions.iter_mut() {
-        if incoming.resume_id.is_none() {
-            if let Some(old) = s.data.sessions.iter().find(|x| x.id == incoming.id) {
+        if let Some(old) = s.data.sessions.iter().find(|x| x.id == incoming.id) {
+            if incoming.resume_id.is_none() {
                 incoming.resume_id = old.resume_id.clone();
+            }
+            if incoming.transcript_path.is_none() {
+                incoming.transcript_path = old.transcript_path.clone();
             }
         }
     }
@@ -228,8 +233,14 @@ pub fn mime_for(path: &str) -> &'static str {
 
 // Резолв клика по пути из вывода терминала: прямой путь от cwd; если файла нет —
 // ищем по имени в папке воркспейса (агент часто печатает голое имя без подпапки).
+// H7 (аудит 2026-06-17): cwd ОБЯЗАН быть внутри разрешённых корней (папки воркспейсов + cwd
+// сессий). Иначе вернуть исходную ссылку как есть — НЕ запускаем рекурсивный поиск по чужим
+// деревьям (напр. cwd="/etc" + reference="passwd"). path_allowed fail-open пока roots пуст.
 #[tauri::command]
 pub fn fs_resolve(cwd: String, reference: String) -> String {
+    if !path_allowed(&cwd) {
+        return reference;
+    }
     let clean = reference.trim_start_matches("./");
     let abs = if clean.starts_with('/') {
         clean.to_string()
@@ -332,6 +343,16 @@ pub fn git_status(folder: String) -> Vec<ChangedFile> {
 // Репо → git show HEAD; не-git → снимок-трекер (RFC 0011 A1).
 #[tauri::command]
 pub fn git_diff_file(folder: String, path: String) -> DiffPair {
+    // H5: гейт против traversal (`../../.ssh/id_rsa`, абсолют, симлинк наружу) на ОБЕ ветки —
+    // и git, и не-git (tracker). gitops::diff_file проверяет сам, но tracker::diff — нет,
+    // поэтому ставим барьер тут, на IPC-границе, до маршрутизации.
+    if let Err(e) = gitops::ensure_safe_rel_path(&folder, &path) {
+        return DiffPair {
+            old_text: String::new(),
+            new_text: format!("⟨отказано⟩ небезопасный путь: {e}"),
+            status: "error".to_string(),
+        };
+    }
     if gitops::is_repo(&folder) {
         gitops::diff_file(&folder, &path)
     } else {
@@ -369,16 +390,21 @@ pub fn merge_undo(clone_of: String, backup_sha: String) -> OpResult {
 }
 
 // ── GitHub (через gh CLI) ──
+// ВАЖНО: команды ASYNC. `gh` ходит в сеть (gh api user / gh repo list) через блокирующий
+// `Command::output()`. Синхронная (`pub fn`) Tauri-команда крутится на ГЛАВНОМ потоке и морозит
+// отрисовку WebView на всё время сетевого вызова (~1.5-4с) — из-за этого окно нового воркспейса
+// открывалось с задержкой (его useEffect зовёт github_status/repos при монтаже). `async fn` Tauri
+// уводит с главного потока → окно рисуется сразу, репозитории догружаются в фоне.
 #[tauri::command]
-pub fn github_status() -> crate::github::GithubStatus {
+pub async fn github_status() -> crate::github::GithubStatus {
     crate::github::status()
 }
 #[tauri::command]
-pub fn github_repos() -> Result<Vec<crate::github::GithubRepo>, String> {
+pub async fn github_repos() -> Result<Vec<crate::github::GithubRepo>, String> {
     crate::github::repos()
 }
 #[tauri::command]
-pub fn github_clone(repo: String, dest: String) -> Result<String, String> {
+pub async fn github_clone(repo: String, dest: String) -> Result<String, String> {
     crate::github::clone(&repo, &dest)
 }
 
@@ -409,14 +435,18 @@ pub fn session_create(
         .or(ws_folder.filter(|s| !s.is_empty()))
         .unwrap_or_else(|| dirs::home_dir().map(|p| p.to_string_lossy().to_string()).unwrap_or_else(|| "/".into()));
 
-    let (name, command_line) = agents::resolve(&input.agent_id, &custom, false, None);
-    // доп. флаги к команде агента (напр. `claude` + `--model …`)
-    let command_line = match input.extra_args.as_ref().map(|s| s.trim()).filter(|s| !s.is_empty()) {
-        Some(a) => command_line.map(|c| format!("{} {}", c, a)),
-        None => command_line,
+    let (name, command_argv) = agents::resolve(&input.agent_id, &custom, false, None);
+    // доп. флаги к команде агента (напр. `claude` + `--model …`). C1/C5: extra_args разбираем в
+    // ОТДЕЛЬНЫЕ argv-токены (без интерпретации шеллом); недопустимые метасимволы — отклоняем.
+    let command_argv = match append_extra_args(command_argv, input.extra_args.as_deref()) {
+        Ok(v) => v,
+        Err(e) => {
+            let _ = app.emit("toast", serde_json::json!({ "kind": "error", "text": e }));
+            return Err(e);
+        }
     };
-    // RFC 0015: режим доверия CLI (Deck-сессии) — нативный флаг запуска
-    let command_line = apply_perm_flags(&input.agent_id, command_line, &settings);
+    // RFC 0015 / H3/H4/L2: режим доверия CLI — нативные флаги ОТДЕЛЬНЫМИ argv-токенами + whitelist.
+    let command_argv = apply_perm_flags(&input.agent_id, command_argv, &settings);
 
     let mut clone_of: Option<String> = None;
     let mut branch: Option<String> = None;
@@ -493,21 +523,64 @@ pub fn session_create(
         // создаётся серой (idle) — отслеживание начнётся с первого промта пользователя (см. pty.rs)
         status: "idle".to_string(),
         first_prompt: input.first_prompt.clone(),
-        resume_id: None, // заполнится из хука по ходу сессии (RFC 0007)
+        resume_id: None,        // заполнится из хука по ходу сессии (RFC 0007)
+        transcript_path: None,  // заполнится из хука вместе с resume_id (C3)
         created_at: now_ms(),
         alive: true,
         shell: input.shell.clone().filter(|s| !s.is_empty()),
         extra_args: input.extra_args.clone().filter(|s| !s.is_empty()),
     };
 
-    ptm.spawn(&app, &session.id, command_line, &cwd, input.first_prompt.clone(), input.shell.clone())?;
+    ptm.spawn(&app, &session.id, command_argv, &cwd, input.first_prompt.clone(), input.shell.clone())?;
     Ok(session)
 }
 
-// RFC 0007: жив ли нативный resume-id Claude (файл транскрипта `~/.claude/projects/*/<id>.jsonl`
-// ещё существует). Папку-hash не знаем → сканируем все проекты. Пусто/нет → невалиден.
+// C1/C5 (аудит 2026-06-17): шелл-метасимволы, которые отвергаем в extra_args. Даже при argv-запуске
+// (где они стали бы литералом) такие символы в «доп. флагах» — почти всегда ошибка/попытка инъекции,
+// поэтому явно режем с понятной ошибкой, а не пропускаем как имя файла.
+fn has_shell_metachars(s: &str) -> bool {
+    s.chars()
+        .any(|c| matches!(c, '\n' | '\r' | ';' | '|' | '&' | '$' | '`' | '(' | ')' | '<' | '>'))
+}
+
+// C1/C5: разобрать extra_args в ОТДЕЛЬНЫЕ argv-токены и дописать к команде агента. Пусто → команда
+// без изменений. Метасимволы → ошибка (не запускаем). Если команды нет (shell) — extra_args
+// игнорируем (некуда дописывать). Возвращаем Err с текстом для тоста.
+fn append_extra_args(
+    argv: Option<Vec<String>>,
+    extra: Option<&str>,
+) -> Result<Option<Vec<String>>, String> {
+    let extra = match extra.map(|s| s.trim()).filter(|s| !s.is_empty()) {
+        Some(e) => e,
+        None => return Ok(argv),
+    };
+    if has_shell_metachars(extra) {
+        return Err("Доп. аргументы содержат недопустимые символы (; | & $ ` ( ) < > перенос строки) — убери их".to_string());
+    }
+    // shlex учитывает кавычки: `--system-prompt "be brief"` → 2 токена. Несбалансированные
+    // кавычки → None → ошибка (иначе тихо склеили бы неверно).
+    let extra_tokens = shlex::split(extra)
+        .ok_or_else(|| "Доп. аргументы: незакрытая кавычка".to_string())?;
+    Ok(match argv {
+        Some(mut v) => {
+            v.extend(extra_tokens);
+            Some(v)
+        }
+        None => None, // shell без команды — дописывать некуда
+    })
+}
+
+// H3/H4/L2: допустимые значения «режима доверия». Whitelist — даже подменённый локально файл
+// настроек не протащит произвольную строку (и тем более метасимвол) в argv.
+const CLAUDE_PERMISSION_MODES: &[&str] = &["default", "acceptEdits", "bypassPermissions", "plan"];
+const CODEX_APPROVALS: &[&str] = &["untrusted", "on-failure", "on-request", "never"];
+const CODEX_SANDBOXES: &[&str] = &["read-only", "workspace-write", "danger-full-access"];
+
+// RFC 0007 / C3: жив ли нативный resume-id Claude. Сначала проверяем ФОРМАТ (hex+дефис, ≥8) —
+// id с метасимволами невалиден сразу. Затем сканируем `~/.claude/projects/*/<id>.jsonl`.
+// Папку-hash не знаем → перебор проектов (fallback для старых сессий без сохранённого пути).
 fn claude_resume_valid(id: &str) -> bool {
-    if id.is_empty() {
+    if !agents::is_valid_resume_id(id) {
         return false;
     }
     let base = match dirs::home_dir() {
@@ -518,7 +591,7 @@ fn claude_resume_valid(id: &str) -> bool {
         Ok(r) => r,
         Err(_) => return false,
     };
-    let fname = format!("{id}.jsonl");
+    let fname = format!("{}.jsonl", id.trim());
     for e in rd.flatten() {
         if e.path().join(&fname).exists() {
             return true;
@@ -527,25 +600,67 @@ fn claude_resume_valid(id: &str) -> bool {
     false
 }
 
-// RFC 0015: дописать нативный флаг «режима доверия» к команде CLI (Deck-сессии). Пусто = не трогаем.
-fn apply_perm_flags(agent_id: &str, cmd: Option<String>, settings: &crate::types::Settings) -> Option<String> {
-    cmd.map(|c| {
-        let mut x = String::new();
+// C3: путь транскрипта (если сохранён хуком) существует и читается ПРЯМО СЕЙЧАС. Имя файла должно
+// совпадать с resume_id (защита от рассинхрона/подмены: путь указывает на этот, а не чужой файл).
+fn transcript_path_usable(path: &str, resume_id: &str) -> bool {
+    if !agents::is_valid_resume_id(resume_id) {
+        return false;
+    }
+    let p = std::path::Path::new(path);
+    let stem_ok = p.file_stem().and_then(|s| s.to_str()) == Some(resume_id.trim());
+    // ре-проверка перед запуском: файл на месте И открывается на чтение (не TOCTOU-only existence).
+    stem_ok && std::fs::File::open(p).is_ok()
+}
+
+// C3: можно ли точно восстановить Claude по сохранённому resume_id. Быстрый путь — сохранённый
+// transcript_path (без скана всех проектов); fallback — скан по resume_id (старые сессии без пути).
+fn claude_resume_usable(session: &Session) -> bool {
+    if session.agent_id != "claude" {
+        return false;
+    }
+    let rid = match session.resume_id.as_deref() {
+        Some(r) => r,
+        None => return false,
+    };
+    if let Some(tp) = session.transcript_path.as_deref() {
+        if transcript_path_usable(tp, rid) {
+            return true;
+        }
+    }
+    claude_resume_valid(rid)
+}
+
+// RFC 0015 / H3/H4/L2: дописать нативный флаг «режима доверия» к argv агента ОТДЕЛЬНЫМИ токенами,
+// только если значение из настроек прошло whitelist. Пусто/невалидно = не передаём флаг.
+fn apply_perm_flags(
+    agent_id: &str,
+    argv: Option<Vec<String>>,
+    settings: &crate::types::Settings,
+) -> Option<Vec<String>> {
+    argv.map(|mut v| {
         match agent_id {
-            "claude" if !settings.claude_permission_mode.trim().is_empty() => {
-                x.push_str(&format!(" --permission-mode {}", settings.claude_permission_mode.trim()));
+            "claude" => {
+                let m = settings.claude_permission_mode.trim();
+                if CLAUDE_PERMISSION_MODES.contains(&m) {
+                    v.push("--permission-mode".to_string());
+                    v.push(m.to_string());
+                }
             }
             "codex" => {
-                if !settings.codex_approval.trim().is_empty() {
-                    x.push_str(&format!(" -a {}", settings.codex_approval.trim()));
+                let a = settings.codex_approval.trim();
+                if CODEX_APPROVALS.contains(&a) {
+                    v.push("-a".to_string());
+                    v.push(a.to_string());
                 }
-                if !settings.codex_sandbox.trim().is_empty() {
-                    x.push_str(&format!(" -s {}", settings.codex_sandbox.trim()));
+                let s = settings.codex_sandbox.trim();
+                if CODEX_SANDBOXES.contains(&s) {
+                    v.push("-s".to_string());
+                    v.push(s.to_string());
                 }
             }
             _ => {}
         }
-        format!("{c}{x}")
+        v
     })
 }
 
@@ -558,19 +673,20 @@ fn spawn_for_resume(
     settings: &crate::types::Settings,
     session: &Session,
 ) -> bool {
-    // RFC 0007: точный resume только если нативный id Claude ещё валиден (файл транскрипта на месте),
-    // иначе id опускаем → resolve упадёт в --continue (не в ошибку «No conversation found»).
+    // RFC 0007 / C3: точный resume только если нативный id Claude ещё валиден И файл транскрипта
+    // читается прямо сейчас (ре-проверка перед запуском, не только existence). Иначе id опускаем →
+    // resolve упадёт в --continue (не в ошибку «No conversation found»).
     let rid = session
         .resume_id
         .as_deref()
-        .filter(|id| session.agent_id == "claude" && claude_resume_valid(id));
-    let (_name, command_line) = agents::resolve(&session.agent_id, custom, true, rid);
-    let command_line = match session.extra_args.as_ref().map(|s| s.trim()).filter(|s| !s.is_empty()) {
-        Some(a) => command_line.map(|c| format!("{} {}", c, a)),
-        None => command_line,
-    };
-    let command_line = apply_perm_flags(&session.agent_id, command_line, settings);
-    ptm.spawn(app, &session.id, command_line, &session.cwd, None, session.shell.clone())
+        .filter(|_| claude_resume_usable(session));
+    let (_name, command_argv) = agents::resolve(&session.agent_id, custom, true, rid);
+    // C1/C5: extra_args сохранённой сессии тоже разбираем безопасно; метасимволы → откат к команде
+    // без них (на восстановлении не валим запуск из-за подпорченного стейта — просто стартуем чисто).
+    let command_argv = append_extra_args(command_argv.clone(), session.extra_args.as_deref())
+        .unwrap_or(command_argv);
+    let command_argv = apply_perm_flags(&session.agent_id, command_argv, settings);
+    ptm.spawn(app, &session.id, command_argv, &session.cwd, None, session.shell.clone())
         .is_ok()
 }
 
@@ -758,4 +874,122 @@ pub fn pty_buffer(ptm: State<'_, PtyManager>, session_id: String) -> String {
 #[tauri::command]
 pub fn usage_snapshot() -> Vec<crate::usage::CliReport> {
     crate::usage::usage_report()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::types::Settings;
+
+    // C1/C5: extra_args с метасимволами — отклоняются (инъекция невозможна на входе).
+    #[test]
+    fn extra_args_reject_shell_metachars() {
+        let base = || Some(vec!["claude".to_string()]);
+        for bad in [
+            "; rm -rf /",
+            "--model x; rm -rf /",
+            "| cat /etc/passwd",
+            "$(whoami)",
+            "`id`",
+            "--model x && curl evil",
+            "--model x\nrm -rf /",
+            "--model x > /tmp/out",
+        ] {
+            assert!(has_shell_metachars(bad), "должен ловиться метасимвол: {bad:?}");
+            let r = append_extra_args(base(), Some(bad));
+            assert!(r.is_err(), "extra_args должны быть отклонены: {bad:?}");
+        }
+    }
+
+    // C1: безопасные extra_args становятся ОТДЕЛЬНЫМИ argv-токенами (без интерпретации шеллом).
+    // Даже если бы `;` прошёл — он бы стал литералом-токеном, а не разделителем команд.
+    #[test]
+    fn extra_args_split_into_separate_argv() {
+        let argv = append_extra_args(Some(vec!["claude".to_string()]), Some("--model sonnet"))
+            .unwrap()
+            .unwrap();
+        assert_eq!(argv, vec!["claude", "--model", "sonnet"]);
+        // кавычки → один токен с пробелом внутри (значение не разрывается)
+        let argv = append_extra_args(Some(vec!["claude".to_string()]), Some("--system-prompt \"be brief\""))
+            .unwrap()
+            .unwrap();
+        assert_eq!(argv, vec!["claude", "--system-prompt", "be brief"]);
+    }
+
+    // C1/C4 (адверсарно): даже собранный из argv-токенов и POSIX-экранированный shlex::try_join
+    // НЕ создаёт инъекцию — `;`/`$()` остаются внутри кавычек как данные. Здесь проверяем, что
+    // try_join любых данных снова парсится обратно В ТЕ ЖЕ токены (round-trip = нет инъекции).
+    #[test]
+    fn argv_join_roundtrip_no_injection() {
+        let argv = vec![
+            "claude".to_string(),
+            "--system-prompt".to_string(),
+            "; rm -rf / $(whoami) `id`".to_string(), // данные, не команда
+        ];
+        let joined = shlex::try_join(argv.iter().map(|s| s.as_str())).unwrap();
+        let reparsed = shlex::split(&joined).unwrap();
+        assert_eq!(reparsed, argv, "опасные данные не должны расщепляться на команды");
+    }
+
+    // H3/H4/L2: значения «режима доверия» проходят только из whitelist; мусор/метасимвол — отброшен.
+    #[test]
+    fn perm_flags_whitelist_only() {
+        let mut st = Settings::default();
+        st.claude_permission_mode = "acceptEdits".to_string();
+        let argv = apply_perm_flags("claude", Some(vec!["claude".to_string()]), &st).unwrap();
+        assert_eq!(argv, vec!["claude", "--permission-mode", "acceptEdits"]);
+
+        // инъекция в настройках → не проходит whitelist → флаг не добавлен
+        st.claude_permission_mode = "ask; rm -rf /".to_string();
+        let argv = apply_perm_flags("claude", Some(vec!["claude".to_string()]), &st).unwrap();
+        assert_eq!(argv, vec!["claude"], "значение вне whitelist не должно попадать в argv");
+
+        // codex -a/-s whitelist
+        let mut cx = Settings::default();
+        cx.codex_approval = "on-request".to_string();
+        cx.codex_sandbox = "workspace-write".to_string();
+        let argv = apply_perm_flags("codex", Some(vec!["codex".to_string()]), &cx).unwrap();
+        assert_eq!(argv, vec!["codex", "-a", "on-request", "-s", "workspace-write"]);
+        cx.codex_sandbox = "$(evil)".to_string();
+        let argv = apply_perm_flags("codex", Some(vec!["codex".to_string()]), &cx).unwrap();
+        assert!(!argv.iter().any(|x| x == "-s"), "мусорный sandbox не должен попадать: {argv:?}");
+    }
+
+    // C3: формат resume_id (через публичную проверку agents) + transcript_path stem-match.
+    #[test]
+    fn resume_id_format_and_transcript_stem() {
+        assert!(crate::agents::is_valid_resume_id("0b58636d-10fe-4a2b-9c3d-1234567890ab"));
+        assert!(crate::agents::is_valid_resume_id("abcdef12"));
+        assert!(!crate::agents::is_valid_resume_id("short"));
+        assert!(!crate::agents::is_valid_resume_id("id'; rm -rf /; '"));
+        assert!(!crate::agents::is_valid_resume_id("../../etc/passwd"));
+        // несуществующий путь с валидным id → не usable (файл не открывается)
+        assert!(!transcript_path_usable("/nonexistent/0b58636d-10fe.jsonl", "0b58636d-10fe"));
+        // путь, чьё имя НЕ совпадает с resume_id → не usable (защита от подмены)
+        assert!(!transcript_path_usable("/tmp/other.jsonl", "0b58636d-10fe"));
+        // невалидный resume_id → не usable независимо от пути
+        assert!(!transcript_path_usable("/tmp/x.jsonl", "; rm -rf /"));
+    }
+
+    // H7: fs_resolve с cwd вне разрешённых корней возвращает исходную ссылку (не резолвит в чужое).
+    #[test]
+    fn fs_resolve_rejects_out_of_root_cwd() {
+        // Задаём корнем уникальную временную папку.
+        let tmp = std::env::temp_dir().join(format!("deck-test-root-{}", now_ms()));
+        std::fs::create_dir_all(&tmp).unwrap();
+        let root = tmp.to_string_lossy().to_string();
+        set_allowed_roots(vec![root.clone()]);
+
+        // cwd вне корня (/etc) → возвращаем reference как есть, поиск не запускаем
+        let out = fs_resolve("/etc".to_string(), "passwd".to_string());
+        assert_eq!(out, "passwd", "out-of-root cwd не должен резолвиться");
+
+        // cwd внутри корня → работает обычный резолв (файла нет → вернётся абсолютный путь-кандидат)
+        let out = fs_resolve(root.clone(), "nope.txt".to_string());
+        assert!(out.starts_with(&root), "in-root cwd должен резолвиться от cwd: {out}");
+
+        // вернуть fail-open состояние, чтобы не влиять на другие тесты
+        set_allowed_roots(vec![]);
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
 }

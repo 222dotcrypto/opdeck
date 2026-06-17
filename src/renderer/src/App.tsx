@@ -6,8 +6,10 @@ import Sidebar from './components/Sidebar'
 import WorkspaceArea from './components/WorkspaceArea'
 import Overview from './components/Overview'
 import Review from './components/Review'
+import Backlog from './components/Backlog'
 import Settings from './components/Settings'
 import NewWorkspaceModal from './components/NewWorkspaceModal'
+import CommandPalette from './components/CommandPalette'
 import Toasts from './components/Toasts'
 
 export default function App(): JSX.Element {
@@ -15,6 +17,8 @@ export default function App(): JSX.Element {
   const init = useStore((s) => s.init)
   const tab = useStore((s) => s.tab)
   const sidebarCollapsed = useStore((s) => s.sidebarCollapsed)
+  // RFC 0017 X1: командная палитра (Cmd+K / Ctrl+K)
+  const commandPaletteOpen = useStore((s) => s.commandPaletteOpen)
   const [showNew, setShowNew] = useState(false)
   const [newGroupName, setNewGroupName] = useState('')
   const openNew = (groupName = ''): void => {
@@ -78,17 +82,47 @@ export default function App(): JSX.Element {
     return () => un?.()
   }, [])
 
-  // Горячие клавиши
+  // Горячие клавиши.
+  // Слушаем в фазе ПЕРЕХВАТА (capture, третий аргумент = true): окно видит нажатие ПЕРВЫМ,
+  // раньше, чем фокус-терминал (xterm) успеет его «съесть». Это важно для Ctrl/Cmd+Shift+C:
+  // без перехвата xterm проглатывал комбо до всплытия к window, и беклог не открывался.
+  // ВАЖНО: перехватываем (preventDefault/stopImmediatePropagation) ТОЛЬКО на совпавших
+  // комбо — для любых прочих клавиш ничего не делаем, чтобы ввод в терминал и Ctrl+C
+  // (прерывание процесса) продолжали работать как обычно.
   useEffect(() => {
     const onKey = (e: KeyboardEvent): void => {
-      if (e.ctrlKey && !e.shiftKey && e.key.toLowerCase() === 'n') {
+      const k = e.key.toLowerCase()
+      // RFC 0017 X1: командная палитра — Cmd+K (mac) ИЛИ Ctrl+K (Win/Linux). Перехватываем
+      // в фазе capture (как Ctrl+Shift+C ниже), иначе фокус-терминал (xterm) проглотит комбо.
+      // Тоггл: открыта → закрыть, закрыта → открыть. Читаем СВЕЖИЙ снимок флага из стора.
+      if ((e.ctrlKey || e.metaKey) && !e.shiftKey && !e.altKey && k === 'k') {
+        e.preventDefault()
+        e.stopImmediatePropagation()
+        const st = useStore.getState()
+        st.setCommandPaletteOpen(!st.commandPaletteOpen)
+        return
+      }
+      // RFC 0016: быстрый захват задачи — открыть вкладку «Задачи» и сфокусировать ввод.
+      // Ctrl+Shift+C (Win/Linux) ИЛИ Cmd+Shift+C (mac). In-app, не глобальный OS-хоткей.
+      if ((e.ctrlKey || e.metaKey) && e.shiftKey && k === 'c') {
+        e.preventDefault()
+        e.stopImmediatePropagation() // не даём фокус-терминалу перехватить комбо
+        useStore.getState().setTab('backlog')
+        // даём вкладке отрисоваться, затем фокусируем поле быстрого ввода задачи
+        setTimeout(() => {
+          document.getElementById('backlog-quick-input')?.focus()
+        }, 0)
+      } else if ((e.ctrlKey || e.metaKey) && !e.shiftKey && !e.altKey && k === 'n') {
+        // Новый воркспейс: Ctrl+N (Win/Linux) ИЛИ Cmd+N (mac).
         e.preventDefault()
         openNew()
-      } else if (e.ctrlKey && e.key >= '1' && e.key <= '9') {
+      } else if ((e.ctrlKey || e.metaKey) && e.key >= '1' && e.key <= '9') {
+        // Переключение воркспейса 1-9: Ctrl+цифра (Win/Linux) ИЛИ Cmd+цифра (mac).
         const idx = Number(e.key) - 1
         const ws = useStore.getState().workspaces[idx]
         if (ws) useStore.getState().setActiveWorkspace(ws.id)
-      } else if (e.ctrlKey && e.shiftKey && e.key.toLowerCase() === 'u') {
+      } else if ((e.ctrlKey || e.metaKey) && e.shiftKey && k === 'u') {
+        // Прыжок к активной сессии: Ctrl+Shift+U (Win/Linux) ИЛИ Cmd+Shift+U (mac).
         // прыжок к последней работающей/ждущей сессии
         const st = useStore.getState()
         const target = [...st.sessions].reverse().find((s) => ['working', 'awaiting'].includes(s.status))
@@ -98,9 +132,10 @@ export default function App(): JSX.Element {
           st.setTab('workspace')
         }
       }
+      // прочие клавиши не трогаем — ни preventDefault, ни stop: терминал печатает свободно
     }
-    window.addEventListener('keydown', onKey)
-    return () => window.removeEventListener('keydown', onKey)
+    window.addEventListener('keydown', onKey, true)
+    return () => window.removeEventListener('keydown', onKey, true)
   }, [])
 
   if (!loaded) {
@@ -116,21 +151,26 @@ export default function App(): JSX.Element {
           <Sidebar onNew={openNew} />
         </div>
         <main className="main">
-          {tab === 'overview' ? (
-            <Overview onNew={openNew} />
-          ) : tab === 'review' ? (
-            <Review />
-          ) : tab === 'settings' ? (
-            <Settings />
-          ) : (
+          {/* WorkspaceArea держим ВСЕГДА смонтированной, прячем через display:none, когда вкладка
+              ≠ воркспейс. Иначе переключение во вкладку размонтировало бы терминалы (term.dispose
+              на каждую сессию = лаг ~1-2с при заходе в Настройки) и перезаливало 2МБ-буфер при
+              возврате. safeFit в TerminalPane при нулевых размерах (display:none) НЕ трогает PTY
+              → агентский TUI не сбивается; ResizeObserver сам перефитит при возврате. */}
+          <div style={{ display: tab === 'workspace' ? 'contents' : 'none' }}>
             <WorkspaceArea />
-          )}
+          </div>
+          {tab === 'overview' && <Overview onNew={openNew} />}
+          {tab === 'review' && <Review />}
+          {tab === 'backlog' && <Backlog />}
+          {tab === 'settings' && <Settings />}
         </main>
       </div>
       <Toasts />
       {showNew && (
         <NewWorkspaceModal defaultGroupName={newGroupName} onClose={() => setShowNew(false)} />
       )}
+      {/* RFC 0017 X1: командная палитра поверх всего; «Новый воркспейс» переиспользует openNew */}
+      {commandPaletteOpen && <CommandPalette onNew={() => openNew()} />}
     </div>
   )
 }

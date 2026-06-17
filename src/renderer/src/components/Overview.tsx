@@ -1,8 +1,8 @@
-import { useEffect, useState } from 'react'
+import { useEffect, useMemo, useState } from 'react'
 import { useStore } from '../store'
 import AddSessionForm from './AddSessionForm'
 import EditableName from './EditableName'
-import type { SessionStatus, Workspace } from '../../../shared/types'
+import type { Session, SessionStatus, Workspace } from '../../../shared/types'
 
 const STATUS_LABEL: Record<SessionStatus, string> = {
   ready: 'готов',
@@ -11,6 +11,10 @@ const STATUS_LABEL: Record<SessionStatus, string> = {
   error: 'ошибка',
   idle: 'простаивает'
 }
+
+// Цель переноса: id группы, либо 'ungrouped' (без группы), либо null (мимо).
+// Зеркало механизма из Sidebar.
+type DropTarget = string | 'ungrouped' | null
 
 // байты → компактно (1.4 ГБ / 320 МБ)
 function fmtBytes(n: number): string {
@@ -31,9 +35,14 @@ export default function Overview({ onNew }: { onNew: (groupName?: string) => voi
   const refreshWorktreeStats = useStore((s) => s.refreshWorktreeStats)
   const killAllSessions = useStore((s) => s.killAllSessions)
   const removeWorktreeFor = useStore((s) => s.removeWorktreeFor)
+  const moveWorkspaceToGroup = useStore((s) => s.moveWorkspaceToGroup)
   const [addingTo, setAddingTo] = useState<string | null>(null)
   const [confirmKill, setConfirmKill] = useState(false)
   const [confirmRemove, setConfirmRemove] = useState<string | null>(null)
+
+  // Перетаскивание воркспейса между группами (ручное, мышью) — как в Sidebar.
+  const [draggingWsId, setDraggingWsId] = useState<string | undefined>()
+  const [dragOverGroup, setDragOverGroup] = useState<DropTarget>(null)
 
   // RFC 0012: освежаем статистику веток при входе в Сводку и при изменении числа сессий
   const aliveCount = sessions.filter((s) => s.alive).length
@@ -41,7 +50,24 @@ export default function Overview({ onNew }: { onNew: (groupName?: string) => voi
     refreshWorktreeStats()
   }, [sessions.length, refreshWorktreeStats])
 
-  const agentName = (id: string): string => agents.find((a) => a.id === id)?.name ?? id
+  // Карта «id сессии → сессия» строится ОДИН раз за рендер: renderColumn раньше
+  // делал sessions.find() на каждый sessionId каждого воркспейса (O(сессии×колонки)).
+  // Зависит только от sessions — смена статуса одной сессии пересоздаёт массив и
+  // карту, что и нужно: карточка статуса должна обновиться.
+  const sessionsById = useMemo(() => {
+    const m = new Map<string, Session>()
+    sessions.forEach((s) => m.set(s.id, s))
+    return m
+  }, [sessions])
+
+  // Имена агентов — тоже карта вместо .find() на каждую карточку.
+  const agentNameById = useMemo(() => {
+    const m = new Map<string, string>()
+    agents.forEach((a) => m.set(a.id, a.name))
+    return m
+  }, [agents])
+
+  const agentName = (id: string): string => agentNameById.get(id) ?? id
 
   const openSession = (wsId: string, sid: string): void => {
     setActiveWorkspace(wsId)
@@ -49,11 +75,64 @@ export default function Overview({ onNew }: { onNew: (groupName?: string) => voi
     useStore.getState().setTab('workspace')
   }
 
+  // Перетаскивание колонки-воркспейса в группу — точное зеркало Sidebar.startWsDrag.
+  // Тащим только за шапку колонки (.ov-col-head), чтобы клики по карточкам,
+  // переименование и кнопка «＋ сессия» продолжали работать как раньше.
+  const startWsDrag = (e: React.MouseEvent, w: Workspace): void => {
+    if (e.button !== 0) return
+    // нажатие на интерактив в шапке (имя, кнопка «＋») — не перетаскивание
+    if ((e.target as HTMLElement).closest('.ov-add, .ov-col-name, input, [contenteditable]')) return
+    const sx = e.clientX
+    const sy = e.clientY
+    let dragging = false
+
+    const groupAt = (x: number, y: number): DropTarget => {
+      const el = (document.elementFromPoint(x, y) as HTMLElement | null)?.closest('[data-drop-group]')
+      const g = el?.getAttribute('data-drop-group')
+      return g === undefined || g === null ? null : (g as DropTarget)
+    }
+
+    const onMove = (ev: MouseEvent): void => {
+      if (!dragging && Math.hypot(ev.clientX - sx, ev.clientY - sy) > 6) {
+        dragging = true
+        setDraggingWsId(w.id)
+        document.body.style.cursor = 'grabbing'
+      }
+      if (dragging) setDragOverGroup(groupAt(ev.clientX, ev.clientY))
+    }
+    const onUp = (ev: MouseEvent): void => {
+      document.removeEventListener('mousemove', onMove)
+      document.removeEventListener('mouseup', onUp)
+      document.body.style.cursor = ''
+      if (dragging) {
+        const g = groupAt(ev.clientX, ev.clientY)
+        if (g !== null) {
+          const target = g === 'ungrouped' ? undefined : g
+          if (target !== w.groupId) moveWorkspaceToGroup(w.id, target)
+        }
+      }
+      // если не таскали — это обычный клик, ничего не перехватываем
+      // (карточки/кнопки сами обрабатывают свои onClick)
+      setDraggingWsId(undefined)
+      setDragOverGroup(null)
+    }
+    document.addEventListener('mousemove', onMove)
+    document.addEventListener('mouseup', onUp)
+  }
+
   const renderColumn = (ws: Workspace): JSX.Element => {
-    const wsSessions = ws.sessionIds.map((id) => sessions.find((s) => s.id === id)).filter(Boolean)
+    // Берём сессии по id из карты (O(1)) вместо .find() по всему массиву.
+    const wsSessions = ws.sessionIds
+      .map((id) => sessionsById.get(id))
+      .filter((s): s is Session => Boolean(s))
     return (
-      <div key={ws.id} className="ov-col">
-        <div className="ov-col-head">
+      <div key={ws.id} className={`ov-col${draggingWsId === ws.id ? ' ov-col-dragging' : ''}`}>
+        <div
+          className="ov-col-head"
+          onMouseDown={(e) => startWsDrag(e, ws)}
+          title="Перетащи в группу, чтобы переместить"
+        >
+          <span className="ov-drag-grip" title="Перетащи в группу">⠿</span>
           <EditableName
             className="ov-col-name"
             value={ws.name}
@@ -168,9 +247,14 @@ export default function Overview({ onNew }: { onNew: (groupName?: string) => voi
       {/* воркспейсы из одной группы — вместе (разная работа по одному проекту) */}
       {groups.map((g) => {
         const wss = workspaces.filter((w) => w.groupId === g.id)
-        if (wss.length === 0) return null
+        // при перетаскивании показываем даже пустые группы как зону сброса
+        if (wss.length === 0 && !draggingWsId) return null
         return (
-          <div key={g.id} className="ov-group">
+          <div
+            key={g.id}
+            className={`ov-group${dragOverGroup === g.id && draggingWsId ? ' ov-drop-into' : ''}`}
+            data-drop-group={g.id}
+          >
             <div className="ov-group-head">
               <EditableName
                 className="ov-group-name"
@@ -182,13 +266,21 @@ export default function Overview({ onNew }: { onNew: (groupName?: string) => voi
                 ＋
               </button>
             </div>
-            <div className="ov-columns">{wss.map(renderColumn)}</div>
+            <div className="ov-columns">
+              {wss.map(renderColumn)}
+              {draggingWsId && wss.length === 0 && (
+                <div className="ov-drop-hint">бросить сюда</div>
+              )}
+            </div>
           </div>
         )
       })}
 
-      {ungrouped.length > 0 && (
-        <div className="ov-group">
+      {(ungrouped.length > 0 || draggingWsId) && (
+        <div
+          className={`ov-group${dragOverGroup === 'ungrouped' && draggingWsId ? ' ov-drop-into' : ''}`}
+          data-drop-group="ungrouped"
+        >
           <div className="ov-group-head">
             <span className="ov-group-name muted">БЕЗ ГРУППЫ</span>
             <span className="ov-group-count">{ungrouped.length}</span>
@@ -196,7 +288,12 @@ export default function Overview({ onNew }: { onNew: (groupName?: string) => voi
               ＋
             </button>
           </div>
-          <div className="ov-columns">{ungrouped.map(renderColumn)}</div>
+          <div className="ov-columns">
+            {ungrouped.map(renderColumn)}
+            {draggingWsId && ungrouped.length === 0 && (
+              <div className="ov-drop-hint">бросить сюда — убрать из группы</div>
+            )}
+          </div>
         </div>
       )}
     </div>

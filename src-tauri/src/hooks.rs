@@ -191,12 +191,80 @@ pub fn hook_port_token() -> Option<(u16, String)> {
     HOOK_INFO.get().cloned()
 }
 
+// M2 (аудит 2026-06-17): токен приёмника хуков из CSPRNG (32 байта = 256 бит), hex.
+// Раньше — наносекунды + bit-rotate: предсказуемо (SystemTime публичен, rotate детерминирован)
+// → локальный злоумышленник мог подобрать токен и слать поддельные события. getrandom тянет
+// из ОС-источника энтропии (/dev/urandom, getentropy). Токены и так перезаписываются на каждом
+// старте Deck → инвалидация старого предсказуемого токена допустима (RFC 0003 / PLAN 0018 OQ).
+// Фолбэк (если ОС-источник недоступен — крайне маловероятно): мешаем нескольких источников
+// энтропии вместо тихой константы, чтобы не выродить токен в предсказуемый.
 fn rand_token() -> String {
-    let n = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|d| d.as_nanos())
-        .unwrap_or(0);
-    format!("{:x}{:x}", n, n.rotate_left(17))
+    let mut bytes = [0u8; 32];
+    if getrandom::getrandom(&mut bytes).is_err() {
+        let n = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|d| d.as_nanos())
+            .unwrap_or(0);
+        let pid = std::process::id() as u128;
+        let addr = &bytes as *const _ as u128;
+        let mix = n ^ pid.rotate_left(31) ^ addr.rotate_left(17);
+        for (i, b) in bytes.iter_mut().enumerate() {
+            *b = ((mix >> ((i % 16) * 8)) as u8) ^ (i as u8).rotate_left(3);
+        }
+    }
+    let mut s = String::with_capacity(64);
+    for b in bytes {
+        use std::fmt::Write as _;
+        let _ = write!(s, "{b:02x}");
+    }
+    s
+}
+
+// M2: сравнение токенов за постоянное время (защита от тайминг-атаки на побайтовом сравнении).
+// Разная длина → сразу false (длина токена не секрет). Иначе XOR всех байт с накоплением в
+// аккумулятор без раннего выхода — время не зависит от позиции первого расхождения.
+fn tokens_eq_ct(a: &str, b: &str) -> bool {
+    let (a, b) = (a.as_bytes(), b.as_bytes());
+    if a.len() != b.len() {
+        return false;
+    }
+    let mut diff: u8 = 0;
+    for (x, y) in a.iter().zip(b.iter()) {
+        diff |= x ^ y;
+    }
+    diff == 0
+}
+
+// H6 (аудит 2026-06-17): записать файл и выставить права 0600 (только владелец) на Unix.
+// Порядок: сперва пробуем создать с правами 0600 через OpenOptions.mode (новый файл рождается
+// уже приватным — нет окна, когда он 0644). Если файл уже существовал/мод не применился —
+// дожимаем set_permissions(0600). На не-Unix просто пишем (модель прав иная).
+fn write_private_file(path: &std::path::Path, bytes: &[u8]) {
+    #[cfg(unix)]
+    {
+        use std::io::Write as _;
+        use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
+        let opened = std::fs::OpenOptions::new()
+            .write(true)
+            .create(true)
+            .truncate(true)
+            .mode(0o600)
+            .open(path);
+        match opened {
+            Ok(mut f) => {
+                let _ = f.write_all(bytes);
+            }
+            Err(_) => {
+                let _ = std::fs::write(path, bytes);
+            }
+        }
+        // дожать права (на случай ранее существовавшего файла с другим режимом)
+        let _ = std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600));
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = std::fs::write(path, bytes);
+    }
 }
 
 // Путь к Deck-файлу хуков Claude (вне ~/.claude — не трогаем личный конфиг).
@@ -334,20 +402,42 @@ fn resume_id_from_transcript(transcript_path: &str) -> Option<String> {
         .filter(|s| !s.is_empty())
 }
 
-// Сохранить resume-id в сессию Deck (RFC 0007). Пишем на диск только если изменилось (id стабилен
-// → одна запись на сессию). session_id здесь — DECK_SESSION_ID (наш id), не нативный.
+// Сохранить resume-id (+ путь транскрипта для C3) в сессию Deck (RFC 0007). Пишем на диск только
+// если изменилось (id стабилен → обычно одна запись на сессию). session_id здесь —
+// DECK_SESSION_ID (наш id), не нативный.
+//
+// H2 (аудит 2026-06-17): гонка с state_save (UI-поток). Оба берут ОДИН Mutex<StateStore> и держат
+// его на весь read-modify-write → каждая операция атомарна (не interleave). Опасность была не в
+// порванной записи, а в ПОТЕРЯННОМ обновлении: UI делает full-replace стейта снимком, снятым ДО
+// прихода хука (resume_id=None), и затёр бы свежий backend-owned resume_id. Защита — на стороне
+// state_save: guard восстанавливает resume_id из текущего s.data, когда входящий пуст. Чтобы
+// guard мог восстановить ОБА backend-owned поля, хук пишет resume_id и transcript_path ВМЕСТЕ
+// (одной критической секцией) — иначе guard на transcript_path не имел бы что восстанавливать.
+// Критическую секцию держим минимальной: блокировка → правка → (опц.) save → разблокировка.
 fn persist_resume_id(app: &tauri::AppHandle, deck_session_id: &str, transcript_path: &str) {
     let rid = match resume_id_from_transcript(transcript_path) {
         Some(r) => r,
         None => return,
     };
+    // нормализуем путь один раз вне лока (IO/строки не под мьютексом)
+    let tpath = transcript_path.trim();
+    let tpath: Option<String> = if tpath.is_empty() { None } else { Some(tpath.to_string()) };
+
     let store = app.state::<Mutex<crate::state::StateStore>>();
-    let mut s = store.lock().unwrap();
+    // отравленный мьютекс (паника соседнего потока) не должен ронять приёмник хуков
+    let mut s = store.lock().unwrap_or_else(|e| e.into_inner());
     let mut changed = false;
     if let Some(sess) = s.data.sessions.iter_mut().find(|x| x.id == deck_session_id) {
         if sess.resume_id.as_deref() != Some(rid.as_str()) {
             sess.resume_id = Some(rid);
             changed = true;
+        }
+        // C3: путь транскрипта — backend-owned, обновляем вместе с resume_id (атомарно под локом)
+        if let Some(tp) = tpath {
+            if sess.transcript_path.as_deref() != Some(tp.as_str()) {
+                sess.transcript_path = Some(tp);
+                changed = true;
+            }
         }
     }
     if changed {
@@ -551,10 +641,13 @@ pub fn start_receiver(app: tauri::AppHandle) -> Option<(u16, String)> {
     let info = (port, token.clone());
     let _ = HOOK_INFO.set(info.clone());
     // Адрес приёмника в файлы (хук читает их в момент срабатывания → переживает рестарт Deck).
+    // H6 (аудит 2026-06-17): права 0600 на оба файла сразу после записи. Иначе токен (и порт)
+    // ложатся с дефолтной umask (часто 0644) → любой локальный пользователь читает токен и шлёт
+    // поддельные хук-события. write_private_file задаёт 0600 на Unix атомарно с записью.
     if let Some(dir) = claude_hooks_path().parent() {
         let _ = std::fs::create_dir_all(dir);
-        let _ = std::fs::write(dir.join("hook-port"), port.to_string());
-        let _ = std::fs::write(dir.join("hook-token"), &token);
+        write_private_file(&dir.join("hook-port"), port.to_string().as_bytes());
+        write_private_file(&dir.join("hook-token"), token.as_bytes());
     }
 
     let tk = token.clone();
@@ -576,7 +669,9 @@ pub fn start_receiver(app: tauri::AppHandle) -> Option<(u16, String)> {
                 }
             }
             let _ = req.respond(tiny_http::Response::empty(204));
-            if tok != tk || sid.is_empty() {
+            // M2: сравнение токена за постоянное время (а не `tok != tk`, который выходит на
+            // первом несовпавшем байте → утечка по таймингу).
+            if !tokens_eq_ct(&tok, &tk) || sid.is_empty() {
                 continue;
             }
             let status = match ev.as_str() {
@@ -678,6 +773,37 @@ mod tests {
             assert!(c.contains("X-Deck-Transcript:"), "{c}");
             assert!(c.contains("transcript_path"), "{c}");
         }
+    }
+
+    // M2 (аудит 2026-06-17): токен из CSPRNG — НЕдетерминирован (два вызова различаются) и длинный
+    // (32 байта → 64 hex-символа), только hex. Предсказуемый наносекундный токен этим не обладал.
+    #[test]
+    fn rand_token_is_nondeterministic_and_long() {
+        let a = rand_token();
+        let b = rand_token();
+        assert_ne!(a, b, "два токена подряд не должны совпадать (CSPRNG)");
+        assert_eq!(a.len(), 64, "32 байта = 64 hex-символа, получили {}", a.len());
+        assert_eq!(b.len(), 64);
+        assert!(
+            a.chars().all(|c| c.is_ascii_hexdigit()),
+            "токен только из hex-цифр: {a}"
+        );
+        // даже из 5 подряд все различны (детектор выродившегося источника энтропии)
+        let set: std::collections::HashSet<String> = (0..5).map(|_| rand_token()).collect();
+        assert_eq!(set.len(), 5, "5 токенов подряд должны быть уникальны");
+    }
+
+    // M2: сравнение токенов за постоянное время — корректность результата (тайминг тут не меряем).
+    #[test]
+    fn tokens_eq_ct_correctness() {
+        assert!(tokens_eq_ct("abc123", "abc123"), "равные → true");
+        assert!(!tokens_eq_ct("abc123", "abc124"), "разные в конце → false");
+        assert!(!tokens_eq_ct("abc123", "Xbc123"), "разные в начале → false");
+        assert!(!tokens_eq_ct("abc", "abc123"), "разная длина → false");
+        assert!(!tokens_eq_ct("", "abc"), "пусто vs непусто → false");
+        assert!(tokens_eq_ct("", ""), "пусто vs пусто → true");
+        let t = rand_token();
+        assert!(tokens_eq_ct(&t, &t.clone()), "сам с собой → true");
     }
 
     // Путь Grok-хуков — глобальный ~/.grok/hooks/deck-status.json (всегда доверенный, не клоббер чужих).

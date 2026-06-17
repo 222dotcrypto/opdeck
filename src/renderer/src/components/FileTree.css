@@ -1,0 +1,72 @@
+/* X2 (RFC 0017): значки git-статуса на дереве + фильтр «только изменённые».
+   Стили только для НОВЫХ классов этой фичи — общие классы дерева живут в index.css. */
+
+/* Шапка дерева с переключателем «только изменённые». */
+.ft-header {
+  display: flex;
+  align-items: center;
+  justify-content: flex-end;
+  padding: 2px 8px 4px;
+}
+
+/* Кнопка-переключатель фильтра. Приглушённая по умолчанию, акцентная когда включена. */
+.ft-filter-toggle {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  font-size: 11px;
+  color: var(--text-2);
+  background: transparent;
+  border: 1px solid var(--line);
+  border-radius: 5px;
+  padding: 2px 7px;
+  cursor: pointer;
+  line-height: 1.4;
+}
+.ft-filter-toggle:hover {
+  background: var(--bg-2);
+}
+.ft-filter-toggle.on {
+  color: var(--accent);
+  border-color: var(--accent);
+}
+
+/* Точка-индикатор «фильтр включён» внутри кнопки. */
+.ft-filter-dot {
+  width: 6px;
+  height: 6px;
+  border-radius: 50%;
+  background: var(--idle);
+  flex-shrink: 0;
+}
+.ft-filter-toggle.on .ft-filter-dot {
+  background: var(--accent);
+}
+
+/* Буквенный значок git-статуса файла (M / + / −). Цвет задаётся инлайном
+   (statusColor), здесь — только раскладка и насыщенность. */
+.ft-badge {
+  flex-shrink: 0;
+  width: 11px;
+  text-align: center;
+  font-size: 10px;
+  font-weight: 700;
+  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+  line-height: 1;
+}
+
+/* Маркер конфликта ⚠ — файл правят ≥2 дерева одновременно. */
+.ft-conflict {
+  flex-shrink: 0;
+  font-size: 10px;
+  line-height: 1;
+  color: var(--working);
+  margin-left: 1px;
+}
+
+/* Заглушка «нет изменённых файлов», когда фильтр включён, а трогать нечего. */
+.ft-empty-changed {
+  padding: 8px 12px;
+  font-size: 11px;
+  color: var(--text-2);
+}

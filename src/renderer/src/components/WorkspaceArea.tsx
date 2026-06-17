@@ -1,4 +1,4 @@
-import { useState } from 'react'
+import { memo, useState } from 'react'
 import { Panel, PanelGroup, PanelResizeHandle } from 'react-resizable-panels'
 import { useStore, diffSourceFolder } from '../store'
 import PanelGrid from './PanelGrid'
@@ -10,8 +10,10 @@ import AddSessionForm from './AddSessionForm'
 import EditableName from './EditableName'
 import LayoutThumb, { colsOfLayout } from './LayoutThumb'
 import { LAYOUTS } from './layouts'
+import SessionInspector from './SessionInspector'
+import './WorkspaceArea.css'
 
-export default function WorkspaceArea(): JSX.Element {
+function WorkspaceArea(): JSX.Element {
   const activeId = useStore((s) => s.activeWorkspaceId)
   const workspaces = useStore((s) => s.workspaces)
   const sessions = useStore((s) => s.sessions)
@@ -27,6 +29,8 @@ export default function WorkspaceArea(): JSX.Element {
   const [showView, setShowView] = useState(false)
   // вид панели файлов/редактора: 'stack' — друг под другом, 'cols' — в два столбика
   const [filesLayout, setFilesLayout] = useState<'stack' | 'cols'>('stack')
+  // RFC 0017 X4: вкладка правой панели — «Файлы» (дерево) или «Инспектор» (по фокус-сессии).
+  const [rpTab, setRpTab] = useState<'files' | 'inspector'>('files')
 
   const ws = workspaces.find((w) => w.id === activeId)
   if (!ws) {
@@ -168,25 +172,48 @@ export default function WorkspaceArea(): JSX.Element {
                 >
                   <Panel defaultSize={filesLayout === 'cols' ? 38 : 42} minSize={10} className="rp-files">
                     <div className="rp-head">
-                      <span>ФАЙЛЫ</span>
-                      <div className="rp-head-tools">
+                      {/* RFC 0017 X4: табы правой панели — «Файлы» (дерево) | «Инспектор» (фокус-сессия) */}
+                      <div className="rp-tabs">
                         <button
-                          className={`vmode ${filesLayout === 'stack' ? 'on' : ''}`}
-                          title="Файлы и редактор друг под другом"
-                          onClick={() => setFilesLayout('stack')}
+                          className={`rp-tab ${rpTab === 'files' ? 'on' : ''}`}
+                          onClick={() => setRpTab('files')}
                         >
-                          ⬓
+                          ФАЙЛЫ
                         </button>
                         <button
-                          className={`vmode ${filesLayout === 'cols' ? 'on' : ''}`}
-                          title="Файлы и редактор в два столбика"
-                          onClick={() => setFilesLayout('cols')}
+                          className={`rp-tab ${rpTab === 'inspector' ? 'on' : ''}`}
+                          onClick={() => setRpTab('inspector')}
                         >
-                          ◫
+                          ИНСПЕКТОР
                         </button>
                       </div>
+                      {/* кнопки раскладки файлы/редактор нужны только для вкладки «Файлы» */}
+                      {rpTab === 'files' && (
+                        <div className="rp-head-tools">
+                          <button
+                            className={`vmode ${filesLayout === 'stack' ? 'on' : ''}`}
+                            title="Файлы и редактор друг под другом"
+                            onClick={() => setFilesLayout('stack')}
+                          >
+                            ⬓
+                          </button>
+                          <button
+                            className={`vmode ${filesLayout === 'cols' ? 'on' : ''}`}
+                            title="Файлы и редактор в два столбика"
+                            onClick={() => setFilesLayout('cols')}
+                          >
+                            ◫
+                          </button>
+                        </div>
+                      )}
                     </div>
-                    {folderEmpty ? (
+                    {rpTab === 'inspector' ? (
+                      // RFC 0017 X4: инспектор сессии (вместо дерева). Дерево «Файлы» цело —
+                      // переключается табом, rightPanelVisible-тоггл не затронут.
+                      <div className="rp-inspector">
+                        <SessionInspector />
+                      </div>
+                    ) : folderEmpty ? (
                       <div className="rp-pick-folder">
                         <button className="btn-primary" onClick={pickFolder}>
                           Выбрать папку
@@ -228,3 +255,9 @@ export default function WorkspaceArea(): JSX.Element {
     </div>
   )
 }
+
+// memo: App перерисовывается на своих стейтах (модалка нового воркспейса, палитра и т.п.) —
+// без memo это каждый раз перерисовывало бы всё поддерево терминалов/дерева файлов (лаг ~1-2с
+// при открытии модалки). Пропсов нет → memo пропускает любые родительские перерисовки; своя
+// реактивность (подписки на стор) сохраняется.
+export default memo(WorkspaceArea)

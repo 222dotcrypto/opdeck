@@ -417,7 +417,12 @@ fn finalize_block(start: i64, last: i64, tokens: u64, cost: f64, now_ms: i64, wi
     let reset_at_ms = start + window_ms;
     let active = now_ms < reset_at_ms;
     let end_ref = if active { now_ms.max(last) } else { last };
-    let elapsed_min = ((end_ref - start) as f64 / 60_000.0).max(1.0);
+    // M4 (аудит 2026-06-17): защита от перекоса часов. Если end_ref < start (часы ушли назад /
+    // таймстемпы вне порядка), `(end_ref - start) as f64` дал бы ОТРИЦАТЕЛЬНое значение, которое
+    // .max(1.0) маскирует, но промежуточные расчёты burn могли бы исказиться. Сначала зажимаем
+    // дельту в неотрицательную (.max(0)), потом минимум окна в 1 минуту → burn всегда конечен и ≥0.
+    let elapsed_ms = ((end_ref - start).max(0)) as f64;
+    let elapsed_min = (elapsed_ms / 60_000.0).max(1.0);
     let burn = tokens as f64 / elapsed_min;
     let projected_tokens = (burn * (window_ms as f64 / 60_000.0)) as u64;
     WindowBlock {
@@ -731,7 +736,14 @@ fn recent_files(root: &Path, ext: &str, prefix: Option<&str>, within_ms: i64, no
     let mut out: Vec<(std::time::SystemTime, PathBuf)> = Vec::new();
     walk(root, ext, prefix, 0, &mut out);
     let cutoff = now - within_ms;
-    out.retain(|(mt, _)| mt.duration_since(UNIX_EPOCH).map(|d| d.as_millis() as i64).unwrap_or(0) >= cutoff);
+    // M5 (аудит 2026-06-17): если mtime не конвертируется в epoch (часы ушли за UNIX_EPOCH назад),
+    // duration_since вернёт Err. Раньше unwrap_or(0) трактовал такой файл как «1970» → он не
+    // проходил порог `>= cutoff` и ТИХО выпадал из свежих, унося реальный расход. Теперь:
+    // нечитаемый timestamp → ПРОПУСКАЕМ файл (filter_map None), не подменяем его эпохой 0.
+    out.retain(|(mt, _)| match mt.duration_since(UNIX_EPOCH) {
+        Ok(d) => (d.as_millis() as i64) >= cutoff,
+        Err(_) => false, // битый timestamp → не считаем «старым 1970», просто пропускаем
+    });
     out.sort_by(|a, b| b.0.cmp(&a.0));
     out.into_iter().take(cap).map(|(_, p)| p).collect()
 }
@@ -1016,6 +1028,26 @@ mod cost_tests {
         assert_eq!(blocks[0].tokens, 150);
         assert_eq!(blocks[1].tokens, 200);
         assert_eq!(blocks[1].reset_at_ms, base + 10 * day + WINDOW_7D_MS);
+    }
+
+    // M4 (аудит 2026-06-17): перекос часов в finalize_block. end_ref < start (часы назад /
+    // таймстемпы вне порядка) → elapsed_min зажат в ≥1, burn конечен и ≥0, projected не взрывается.
+    #[test]
+    fn finalize_block_handles_clock_skew() {
+        // last < start (последняя точка «раньше» старта по таймстемпу) — окно ещё активно
+        let now = 1_000_000i64;
+        let start = 5_000_000i64; // старт «в будущем» относительно last
+        let last = 1_000i64; // последняя точка сильно раньше старта
+        let b = finalize_block(start, last, 10_000, 0.0, now, WINDOW_5H_MS);
+        assert!(b.burn_rate_per_min.is_finite(), "burn должен быть конечным");
+        assert!(b.burn_rate_per_min >= 0.0, "burn не может быть отрицательным: {}", b.burn_rate_per_min);
+        // elapsed зажат в минимум 1 минуту → burn = tokens / 1.0 = 10000
+        assert!((b.burn_rate_per_min - 10_000.0).abs() < 1e-9, "burn={}", b.burn_rate_per_min);
+        assert!(b.projected_tokens >= b.tokens, "projected не должен быть меньше уже потраченного");
+
+        // обычный случай (без перекоса) по-прежнему корректен: 60 мин, 6000 токенов → 100/мин
+        let ok = finalize_block(0, 60 * 60_000, 6_000, 0.0, 60 * 60_000, WINDOW_5H_MS);
+        assert!((ok.burn_rate_per_min - 100.0).abs() < 1e-9, "burn={}", ok.burn_rate_per_min);
     }
 
     #[test]

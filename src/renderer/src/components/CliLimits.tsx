@@ -56,6 +56,36 @@ function fmtWin(min: number): string {
   return `${Math.round(min / 1440)}д`
 }
 
+// Поверхностное сравнение одного окна (5ч/7д) лимита.
+function sameWin(a: CliWin, b: CliWin): boolean {
+  return (
+    a.pct === b.pct &&
+    a.used === b.used &&
+    a.hasPct === b.hasPct &&
+    a.resetInMin === b.resetInMin &&
+    a.windowMin === b.windowMin
+  )
+}
+// perf: одинаковы ли два отчёта по существу — чтобы не дёргать setReports на идентичных данных.
+function sameReports(a: CliReport[], b: CliReport[]): boolean {
+  if (a === b) return true
+  if (a.length !== b.length) return false
+  for (let i = 0; i < a.length; i++) {
+    const x = a[i]
+    const y = b[i]
+    if (
+      x.id !== y.id ||
+      x.name !== y.name ||
+      x.hasData !== y.hasData ||
+      !sameWin(x.w5, y.w5) ||
+      !sameWin(x.w7, y.w7)
+    ) {
+      return false
+    }
+  }
+  return true
+}
+
 export default function CliLimits(): JSX.Element | null {
   const [reports, setReports] = useState<CliReport[]>([])
   const [win, setWin] = useState<'w5' | 'w7'>(() => (localStorage.getItem(WIN_KEY) === 'w7' ? 'w7' : 'w5'))
@@ -67,12 +97,38 @@ export default function CliLimits(): JSX.Element | null {
     let alive = true
     const load = (): void => {
       invoke<CliReport[]>('usage_snapshot')
-        .then((r) => { if (alive) setReports(r) })
+        .then((r) => {
+          if (!alive) return
+          // perf: не плодим новую ссылку массива каждый опрос — обновляем state ТОЛЬКО
+          // когда данные реально поменялись (иначе лишние ре-рендеры раз в 30с впустую).
+          setReports((prev) => (sameReports(prev, r) ? prev : r))
+        })
         .catch(() => { /* нет данных — виджет просто пустой */ })
     }
     load()
-    const t = setInterval(load, 30000)
-    return () => { alive = false; clearInterval(t) }
+    let t = window.setInterval(load, 30000)
+    // visibility-pause: окно в фоне → опрос не нужен (квота не наша забота, пока не смотрят).
+    // Вернулись на вкладку → сразу освежаем и снова запускаем интервал.
+    const onVis = (): void => {
+      if (document.visibilityState === 'hidden') {
+        clearInterval(t)
+        t = 0
+      } else {
+        if (!t) t = window.setInterval(load, 30000)
+        load()
+      }
+    }
+    document.addEventListener('visibilitychange', onVis)
+    // если эффект смонтировался уже в фоне — не держим лишний интервал
+    if (document.visibilityState === 'hidden') {
+      clearInterval(t)
+      t = 0
+    }
+    return () => {
+      alive = false
+      if (t) clearInterval(t)
+      document.removeEventListener('visibilitychange', onVis)
+    }
   }, [])
 
   // клик вне виджета закрывает окно

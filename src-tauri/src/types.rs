@@ -71,6 +71,12 @@ pub struct Session {
     // из хука по ходу сессии; при восстановлении на старте → точный `claude --resume <id>`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub resume_id: Option<String>,
+    // C3 (аудит 2026-06-17): полный путь к файлу транскрипта Claude, захваченный из хука вместе с
+    // resume_id. backend-owned (как resume_id). Хранение пути убирает TOCTOU-скан всех проектов:
+    // при восстановлении проверяем, что именно ЭТОТ файл на месте и читается, прямо перед запуском.
+    // Старые сессии без пути → fallback на скан по resume_id (claude_resume_valid).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub transcript_path: Option<String>,
     #[serde(default)]
     pub created_at: i64,
     #[serde(default)]
@@ -155,6 +161,25 @@ impl Default for Settings {
     }
 }
 
+// RFC 0016 — задача беклога. Копится в пульте, кнопкой «В работу» уезжает первым
+// промтом в новую сессию агента. Скрины храним путями к файлам (см. save_image_bytes),
+// а не base64, чтобы не раздувать стейт. kind: bug|idea|feature; status: draft|sent|done.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct BacklogTask {
+    pub id: String,
+    pub title: String,
+    #[serde(default)]
+    pub description: String,
+    pub kind: String,
+    #[serde(default)]
+    pub attachments: Vec<String>,
+    pub status: String,
+    pub created_at: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sent_session_id: Option<String>,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 #[serde(rename_all = "camelCase")]
 pub struct PersistState {
@@ -170,6 +195,9 @@ pub struct PersistState {
     pub custom_agents: Vec<CustomAgent>,
     #[serde(default)]
     pub presets: Vec<WorkspacePreset>,
+    // RFC 0016 — беклог задач (frontend-owned, как остальной стейт).
+    #[serde(default)]
+    pub tasks: Vec<BacklogTask>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub active_workspace_id: Option<String>,
 }

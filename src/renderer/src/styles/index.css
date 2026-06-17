@@ -490,6 +490,25 @@ input[type="checkbox"]:checked::after {
 .ov-card-branch { font-size: 10px; color: var(--accent); margin-top: 3px; }
 .ov-card-empty { color: var(--text-3); font-size: 11.5px; padding: 6px; text-align: center; }
 
+/* перетаскивание колонки-воркспейса в группу (зеркало .sb-group.drop-into) */
+.ov-col-head { cursor: grab; user-select: none; }
+.ov-col-head:active { cursor: grabbing; }
+/* видимая «ручка» перетаскивания — подсказывает, что карточку можно тащить в группу */
+.ov-drag-grip { cursor: grab; color: var(--text-2); opacity: 0.55; font-size: 13px; line-height: 1; letter-spacing: -2px; flex: 0 0 auto; }
+.ov-col-head:hover .ov-drag-grip { opacity: 1; color: var(--accent); }
+.ov-col-dragging { opacity: 0.4; }
+.ov-group { transition: background-color 0.15s ease, box-shadow 0.15s ease; border-radius: 8px; }
+.ov-group.ov-drop-into {
+  background: rgba(88, 166, 255, 0.08);
+  box-shadow: inset 0 0 0 1.5px rgba(88, 166, 255, 0.45);
+}
+.ov-drop-hint {
+  padding: 14px 18px; border: 1.5px dashed var(--line-2);
+  border-radius: 6px; color: var(--text-3); font-size: 11px; text-align: center;
+  align-self: stretch; min-width: 200px; display: grid; place-items: center;
+}
+.ov-group.ov-drop-into .ov-drop-hint { border-color: var(--accent); color: var(--accent); }
+
 /* ── Modal & forms ── */
 .modal-backdrop { position: fixed; inset: 0; background: rgba(0,0,0,0.5); display: grid; place-items: center; z-index: 100; }
 .modal { background: var(--bg-2); border: 1px solid var(--line-2); border-radius: 12px; padding: 20px; width: 440px; max-height: 86vh; overflow: auto; box-shadow: 0 20px 60px rgba(0,0,0,0.5); }
@@ -751,3 +770,91 @@ input[type="checkbox"]:checked::after {
 .cl-pin:hover { border-color: var(--accent); color: var(--accent); }
 .cl-pin.on { color: var(--accent); border-color: var(--accent); background: rgba(88,166,255,0.12); }
 .cl-foot { display: flex; align-items: center; gap: 7px; margin-top: 6px; padding: 7px 4px 2px; border-top: 1px solid var(--line); font-size: 10.5px; color: var(--text-3); }
+
+/* RFC 0016 — беклог задач (вкладка «Задачи»). Доска по статусам (kanban). */
+.backlog { height: 100%; overflow-y: auto; padding: 0 14px 24px; }
+.bl-add { display: flex; gap: 8px; align-items: center; margin: 12px 0 14px; max-width: 720px; }
+.bl-add input { flex: 1; }
+
+/* доска: три колонки в ряд на всю ширину окна; на узком окне — переносятся/стопкой */
+.bl-board { display: flex; gap: 14px; align-items: flex-start; flex-wrap: wrap; }
+.bl-col {
+  flex: 1 1 300px; min-width: 280px;
+  background: var(--bg-2); border: 1px solid var(--line);
+  /* левая цветная полоса колонки = палитра её статуса (idle/working/ready) */
+  border-left: 3px solid var(--idle);
+  border-radius: var(--radius); padding: 10px;
+}
+.bl-col.status-idle { border-left-color: var(--idle); }
+.bl-col.status-working { border-left-color: var(--working); }
+.bl-col.status-ready { border-left-color: var(--ready); }
+.bl-col-head {
+  display: flex; align-items: center; gap: 8px;
+  margin-bottom: 10px; padding-bottom: 7px; border-bottom: 1px solid var(--line);
+}
+.bl-col-name { font-size: 12px; font-weight: 600; color: var(--text); letter-spacing: 0.3px; flex: 1; }
+.bl-col-count {
+  font-size: 11px; color: var(--text-2); background: var(--bg-3);
+  border-radius: 9px; padding: 0 7px; min-width: 20px; text-align: center;
+}
+.bl-col-cards { display: flex; flex-direction: column; gap: 10px; }
+.bl-col-empty {
+  border: 1.5px dashed var(--line); border-radius: 6px;
+  padding: 18px 8px; text-align: center; color: var(--text-3); font-size: 11.5px;
+}
+
+.bl-card { background: var(--bg-2); border: 1px solid var(--line); border-left: 3px solid var(--idle);
+  border-radius: var(--radius); padding: 10px 12px; }
+.bl-card.status-idle { border-left-color: var(--idle); }
+.bl-card.status-working { border-left-color: var(--working); }
+.bl-card.status-ready { border-left-color: var(--ready); }
+.bl-card-top { display: flex; align-items: center; gap: 8px; }
+.bl-title { flex: 1; min-width: 0; background: transparent; border: 1px solid transparent; font-size: 13px; font-weight: 600;
+  color: var(--text); padding: 4px 6px; border-radius: 6px; }
+.bl-title:hover, .bl-title:focus { border-color: var(--line-2); background: var(--bg-3); }
+/* кликабельный бейдж статуса + выпадающий список выбора статуса */
+.bl-status-wrap { position: relative; flex: 0 0 auto; }
+.bl-status {
+  display: inline-flex; align-items: center; gap: 3px;
+  font-size: 10px; padding: 2px 7px; border-radius: 10px;
+  color: var(--text-3); border: 1px solid var(--line); background: transparent;
+}
+.bl-status:hover { border-color: var(--accent); color: var(--text); }
+.bl-status.sent { color: var(--working); border-color: var(--working); }
+.bl-status.done { color: var(--ready); border-color: var(--ready); }
+.bl-status-caret { font-size: 8px; opacity: 0.7; }
+.bl-status-menu {
+  position: absolute; top: calc(100% + 4px); right: 0; z-index: 60; min-width: 116px;
+  background: var(--bg-2); border: 1px solid var(--line-2); border-radius: 8px;
+  padding: 4px; box-shadow: 0 12px 36px rgba(0,0,0,0.5);
+  display: flex; flex-direction: column; gap: 2px;
+}
+.bl-status-opt {
+  text-align: left; padding: 6px 10px; border-radius: 6px; font-size: 12px; color: var(--text-2);
+}
+.bl-status-opt:hover { background: var(--bg-3); color: var(--text); }
+.bl-status-opt.draft.sel { color: var(--idle); }
+.bl-status-opt.sent.sel { color: var(--working); }
+.bl-status-opt.done.sel { color: var(--ready); }
+.bl-status-opt.sel { background: var(--bg-3); font-weight: 600; }
+.bl-del { width: 22px; height: 22px; flex: 0 0 auto; color: var(--text-3); border-radius: 6px; font-size: 12px; }
+.bl-del:hover { color: var(--error); background: var(--bg-3); }
+.bl-desc { width: 100%; margin: 7px 0; resize: vertical; font-size: 12px; }
+.bl-tags { display: flex; gap: 5px; }
+.bl-tag { font-size: 11px; padding: 3px 11px; border-radius: 12px; color: var(--text-3); border: 1px solid var(--line); }
+.bl-tag:hover { border-color: var(--accent); color: var(--text); }
+.bl-tag.sel { background: var(--accent); color: #0b0d12; border-color: var(--accent); font-weight: 600; }
+.bl-thumbs { display: flex; flex-wrap: wrap; gap: 6px; margin-top: 9px; }
+.bl-thumb { position: relative; width: 64px; height: 64px; border: 1px solid var(--line); border-radius: 6px;
+  overflow: hidden; background: var(--bg-3); display: flex; align-items: center; justify-content: center; }
+.bl-thumb img { width: 100%; height: 100%; object-fit: cover; }
+.bl-thumb-x { color: var(--text-3); font-size: 18px; }
+.bl-thumb-rm { position: absolute; top: 2px; right: 2px; width: 18px; height: 18px; font-size: 10px; line-height: 1;
+  background: rgba(0,0,0,0.6); color: #fff; border-radius: 5px; }
+.bl-thumb-rm:hover { background: var(--error); }
+.bl-card-actions { display: flex; align-items: center; gap: 8px; margin-top: 10px; }
+.bl-spacer { flex: 1; }
+.btn-primary.sm { padding: 4px 12px; font-size: 11.5px; }
+.bl-send { margin-top: 10px; padding-top: 10px; border-top: 1px solid var(--line); }
+.bl-send select { width: 100%; margin-bottom: 4px; }
+.bl-hint { font-size: 11px; color: var(--text-3); }

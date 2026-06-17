@@ -34,6 +34,9 @@ export default function Titlebar(): JSX.Element {
         <button className={tab === 'review' ? 'active' : ''} onClick={() => setTab('review')}>
           Ревью
         </button>
+        <button className={tab === 'backlog' ? 'active' : ''} onClick={() => setTab('backlog')}>
+          Задачи
+        </button>
         <button className={tab === 'settings' ? 'active' : ''} onClick={() => setTab('settings')}>
           Настройки
         </button>
