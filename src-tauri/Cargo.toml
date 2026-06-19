@@ -1,6 +1,6 @@
 [package]
 name = "app"
-version = "0.1.0"
+version = "0.1.1"
 description = "opdeck — пульт управления сессиями ИИ-агентов"
 authors = ["danila"]
 license = "MIT"
