@@ -213,8 +213,8 @@ export default function Overview({ onNew }: { onNew: (groupName?: string) => voi
             ⑂ {worktreeStats.count}/{worktreeStats.limit} · {fmtBytes(worktreeStats.diskBytes)}
           </span>
         )}
-        <button className="ws-tb-btn" onClick={() => onNew('')}>
-          ＋ воркспейс
+        <button className="ws-tb-btn icon" title="Новый воркспейс" onClick={() => onNew('')}>
+          ＋
         </button>
         {aliveCount > 0 &&
           (confirmKill ? (
@@ -227,7 +227,7 @@ export default function Overview({ onNew }: { onNew: (groupName?: string) => voi
               onBlur={() => setConfirmKill(false)}
               title="Подтвердить остановку всех агентов"
             >
-              точно убить {aliveCount}?
+              Точно остановить {aliveCount}?
             </button>
           ) : (
             <button
@@ -235,13 +235,13 @@ export default function Overview({ onNew }: { onNew: (groupName?: string) => voi
               onClick={() => setConfirmKill(true)}
               title="Остановить все запущенные агенты (разговор сохранится — можно поднять заново)"
             >
-              ⏹ убить всё
+              Остановить всех агентов
             </button>
           ))}
       </div>
 
       {workspaces.length === 0 && (
-        <div className="ov-empty">Пока нет воркспейсов — создай кнопкой «＋ воркспейс».</div>
+        <div className="ov-empty">Пока нет воркспейсов — создай кнопкой «＋» сверху.</div>
       )}
 
       {/* воркспейсы из одной группы — вместе (разная работа по одному проекту) */}

@@ -423,7 +423,7 @@ input[type="checkbox"]:checked::after {
 /* ── Overview ── */
 .overview { flex: 1; overflow: auto; padding: 16px; }
 /* RFC 0014: вкладка «Ревью» — лента изменений по сессиям */
-.review { flex: 1; overflow: auto; padding: 16px; }
+.review { flex: 1; overflow: auto; padding: 18px 18px 16px; }
 .rv-unit { background: var(--bg-2); border: 1px solid var(--line); border-left: 3px solid var(--idle); border-radius: 8px; padding: 8px 10px; margin-bottom: 10px; }
 .rv-unit.status-working { border-left-color: var(--working); }
 .rv-unit.status-awaiting { border-left-color: var(--awaiting); }
@@ -798,6 +798,12 @@ input[type="checkbox"]:checked::after {
   font-size: 11px; color: var(--text-2); background: var(--bg-3);
   border-radius: 9px; padding: 0 7px; min-width: 20px; text-align: center;
 }
+/* «＋» в шапке колонки — быстрое добавление задачи в этот столбик */
+.bl-col-add { flex: 0 0 auto; width: 24px; height: 22px; border-radius: 6px; font-size: 15px; line-height: 1; color: var(--text-3); }
+.bl-col-add:hover { background: var(--bg-3); color: var(--text); }
+/* icon-only варианты кнопок (голый «＋» вместо «＋ слово») */
+.ws-tb-btn.icon { padding: 3px 9px; font-size: 15px; line-height: 1; }
+.btn-primary.icon { padding: 6px 13px; font-size: 16px; line-height: 1; }
 .bl-col-cards { display: flex; flex-direction: column; gap: 10px; flex: 1; min-height: 0; }
 .bl-col-empty {
   border: 1.5px dashed var(--line); border-radius: 6px;

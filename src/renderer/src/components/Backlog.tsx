@@ -313,11 +313,19 @@ function StatusColumn({
   label: string
   tasks: BacklogTask[]
 }): JSX.Element {
+  const addTask = useStore((s) => s.addTask)
   return (
     <div className={`bl-col ${STATUS_CLASS[status]}`}>
       <div className="bl-col-head">
         <span className="bl-col-name">{label}</span>
         <span className="bl-col-count">{tasks.length}</span>
+        <button
+          className="bl-col-add"
+          title={`Добавить задачу в «${label}»`}
+          onClick={() => addTask({ status })}
+        >
+          ＋
+        </button>
       </div>
       <div className="bl-col-cards">
         {tasks.length === 0 ? (
@@ -361,13 +369,13 @@ export default function Backlog(): JSX.Element {
       <div className="bl-add">
         <input
           id="backlog-quick-input"
-          placeholder="Новая задача — заголовок и Enter (Ctrl+Shift+C)…"
+          placeholder="Впиши задачу и нажми Enter…"
           value={quick}
           onChange={(e) => setQuick(e.target.value)}
           onKeyDown={(e) => e.key === 'Enter' && add()}
         />
-        <button className="btn-primary" onClick={add}>
-          ＋ задача
+        <button className="btn-primary icon" title="Добавить задачу (Ctrl+Shift+C)" onClick={add}>
+          ＋
         </button>
       </div>
 

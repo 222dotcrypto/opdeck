@@ -556,7 +556,7 @@ export default function Review(): JSX.Element {
         (filtersActive && units.length > 0 ? (
           <div className="ov-empty">Под фильтры ничего не подходит — сбросьте фильтры выше.</div>
         ) : (
-          <div className="ov-empty">Изменений нет — агенты ничего не наработали (или всё уже слито).</div>
+          <div className="ov-empty">Пока нечего ревьюить — агенты ещё не меняли файлы (или изменения уже перенесены в main).</div>
         ))}
 
       {byWs.map(({ ws, list }) => (

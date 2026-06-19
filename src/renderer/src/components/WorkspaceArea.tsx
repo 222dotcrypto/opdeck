@@ -136,8 +136,8 @@ function WorkspaceArea(): JSX.Element {
               )}
             </div>
           )}
-          <button className="ws-tb-btn" onClick={() => setAdding(true)}>
-            ＋ Окно
+          <button className="ws-tb-btn icon" title="Добавить окно" onClick={() => setAdding(true)}>
+            ＋
           </button>
         </div>
       </div>
