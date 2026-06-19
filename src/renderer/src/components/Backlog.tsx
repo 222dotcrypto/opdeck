@@ -242,7 +242,6 @@ function TaskCard({ task }: { task: BacklogTask }): JSX.Element {
           value={task.title}
           onChange={(e) => updateTask(task.id, { title: e.target.value })}
         />
-        <StatusBadge task={task} />
         <button className="bl-del" title="Удалить задачу" onClick={() => deleteTask(task.id)}>
           ✕
         </button>
@@ -284,6 +283,7 @@ function TaskCard({ task }: { task: BacklogTask }): JSX.Element {
           style={{ display: 'none' }}
           onChange={onPickFile}
         />
+        <StatusBadge task={task} />
         <button
           className="link-btn"
           title="Прикрепить скрин: выбрать файл или вставить из буфера (Ctrl/Cmd+V) в карточку"
@@ -291,7 +291,6 @@ function TaskCard({ task }: { task: BacklogTask }): JSX.Element {
         >
           ＋ скрин
         </button>
-        <span className="bl-spacer" />
         {showSend ? null : (
           <button className="btn-primary sm" onClick={() => setShowSend(true)}>
             В работу →
