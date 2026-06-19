@@ -208,6 +208,8 @@ export default function EditorPane({
   const [mode, setMode] = useState<'code' | 'preview' | 'browser' | 'diff'>('code')
   // RFC 0017 §Scope 5.1: минимап выключен по умолчанию, тумблер в панели (runtime, без стора).
   const [minimapOn, setMinimapOn] = useState(false)
+  // ⓘ — подсказки по хоткеям прячем во всплывающее окошко (не занимают место постоянно)
+  const [showHints, setShowHints] = useState(false)
   // RFC 0017 §Scope 5.4: отдельная пара «было→стало» ТОЛЬКО для change-bar обычного редактора.
   // Не переиспользуем diffPair, чтобы не зажечь кнопку Diff на неизменённых файлах.
   const [cbPair, setCbPair] = useState<{ oldText: string; newText: string } | null>(null)
@@ -514,6 +516,16 @@ export default function EditorPane({
             Карта
           </button>
         )}
+        {/* ⓘ — кнопка подсказок; само окошко рендерится ниже, в .editor-wrap (вписывается по ширине панели) */}
+        {file && mode === 'code' && (
+          <button
+            className={'editor-icon-btn' + (showHints ? ' on' : '')}
+            onClick={() => setShowHints((v) => !v)}
+            title="Подсказки по горячим клавишам"
+          >
+            ⓘ
+          </button>
+        )}
         {dirty && file && mode === 'code' && (
           <button className="save-btn sm" onClick={save} title="⌘S">
             Сохранить
@@ -637,16 +649,35 @@ export default function EditorPane({
           }}
         />
       )}
-      {/* RFC 0017 §Scope 5.2/5.3: тонкая подсказка по хоткеям — только в обычном редакторе. */}
-      {file && mode === 'code' && (
-        <div className="editor-hint">
-          <span>
-            <kbd>⌥</kbd>+клик — доп. курсор · <kbd>⌥⇧</kbd>+перетаскивание — курсоры столбцом
-          </span>
-          <span>
-            <kbd>⌘⌥[</kbd> свернуть всё · <kbd>⌘⌥]</kbd> развернуть
-          </span>
-        </div>
+      {/* Окошко подсказок по хоткеям — на уровне панели редактора (вписывается по её ширине, не обрезается). */}
+      {showHints && file && mode === 'code' && (
+        <>
+          <div className="editor-hint-backdrop" onClick={() => setShowHints(false)} />
+          <div className="editor-hint-pop" role="dialog">
+            <div className="ehp-title">Кнопки панели сверху</div>
+            <div className="ehp-row"><b className="ehp-b">Редактор</b> — править код файла</div>
+            <div className="ehp-row"><b className="ehp-b">Diff</b> — что изменилось: было → стало</div>
+            <div className="ehp-row"><b className="ehp-b">Превью</b> — просмотр Markdown (для .md)</div>
+            <div className="ehp-row"><b className="ehp-b">Браузер</b> — открыть веб-страницу / HTML</div>
+            <div className="ehp-row"><b className="ehp-b">Карта</b> — миникарта кода справа</div>
+            <div className="ehp-row"><b className="ehp-b">⤢</b> на весь экран · <b className="ehp-b">✕</b> закрыть файл</div>
+            <div className="ehp-sep" />
+            <div className="ehp-title">Горячие клавиши</div>
+            <div className="ehp-row">
+              <kbd>⌥ Option</kbd> + клик мышью — поставить ещё один курсор
+            </div>
+            <div className="ehp-row">
+              <kbd>⌥ Option</kbd> + <kbd>⇧ Shift</kbd> + протянуть мышью — курсоры в столбик
+            </div>
+            <div className="ehp-row">
+              <kbd>⌘ Cmd</kbd> + <kbd>⌥ Option</kbd> + <kbd>[</kbd> — свернуть весь код
+            </div>
+            <div className="ehp-row">
+              <kbd>⌘ Cmd</kbd> + <kbd>⌥ Option</kbd> + <kbd>]</kbd> — развернуть весь код
+            </div>
+            <div className="ehp-foot">Все клавиши приложения — кнопка ⌨ в шапке</div>
+          </div>
+        </>
       )}
     </div>
   )

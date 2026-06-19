@@ -102,6 +102,15 @@ export default function App(): JSX.Element {
         st.setCommandPaletteOpen(!st.commandPaletteOpen)
         return
       }
+      // Cmd/Ctrl + «/» — окно всех горячих клавиш. Голую «?» не вешаем: она нужна для
+      // ввода в терминал/промпт агента; модификатор «/» вводу не мешает.
+      if ((e.ctrlKey || e.metaKey) && !e.shiftKey && !e.altKey && k === '/') {
+        e.preventDefault()
+        e.stopImmediatePropagation()
+        const st = useStore.getState()
+        st.setShortcutsOpen(!st.shortcutsOpen)
+        return
+      }
       // RFC 0016: быстрый захват задачи — открыть вкладку «Задачи» и сфокусировать ввод.
       // Ctrl+Shift+C (Win/Linux) ИЛИ Cmd+Shift+C (mac). In-app, не глобальный OS-хоткей.
       if ((e.ctrlKey || e.metaKey) && e.shiftKey && k === 'c') {

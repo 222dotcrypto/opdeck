@@ -858,3 +858,134 @@ input[type="checkbox"]:checked::after {
 .bl-send { margin-top: 10px; padding-top: 10px; border-top: 1px solid var(--line); }
 .bl-send select { width: 100%; margin-bottom: 4px; }
 .bl-hint { font-size: 11px; color: var(--text-3); }
+
+/* ════════════════════════════════════════════════════════════════════
+   АНИМАЦИИ — современный слой (21st.dev-вайб), 2026-06-18.
+   Только transform/opacity (GPU). Сдержанно под кокпит. Уважает
+   prefers-reduced-motion (глобальный блок вверху файла гасит и эти).
+   ════════════════════════════════════════════════════════════════════ */
+:root {
+  --dur-fast: 0.13s;
+  --dur-med: 0.2s;
+  --dur-slow: 0.3s;
+  --ease-out: cubic-bezier(0.22, 1, 0.36, 1);     /* мягкий выход */
+  --ease-spring: cubic-bezier(0.34, 1.56, 0.64, 1); /* пружина с лёгким перелётом */
+}
+
+@keyframes fade-in-up { from { opacity: 0; transform: translateY(8px); } to { opacity: 1; transform: translateY(0); } }
+@keyframes pop-in     { from { opacity: 0; transform: scale(0.94); }     to { opacity: 1; transform: scale(1); } }
+@keyframes modal-in   { from { opacity: 0; transform: scale(0.93) translateY(-14px); } to { opacity: 1; transform: scale(1) translateY(0); } }
+@keyframes backdrop-in{ from { opacity: 0; } to { opacity: 1; } }
+@keyframes toast-in   { from { opacity: 0; transform: translateX(18px) scale(0.96); } to { opacity: 1; transform: translateX(0) scale(1); } }
+@keyframes dot-breathe{ 0%,100% { transform: scale(1); opacity: 1; } 50% { transform: scale(1.45); opacity: 0.6; } }
+@keyframes ring-pulse { 0%,100% { box-shadow: 0 0 0 0 rgba(68,147,248,0.55); } 50% { box-shadow: 0 0 0 4px rgba(68,147,248,0); } }
+@keyframes seg-pop    { from { transform: scale(0.88); } to { transform: scale(1); } }
+
+/* ── Входы карточек/лент (срабатывают один раз при появлении узла) ── */
+.ov-card, .rv-unit { animation: fade-in-up var(--dur-med) var(--ease-out) both; }
+.bl-card           { animation: pop-in var(--dur-med) var(--ease-spring) both; }
+/* лёгкий стаггер первых элементов ленты/колонок */
+.ov-cards .ov-card:nth-child(2){ animation-delay: .03s } .ov-cards .ov-card:nth-child(3){ animation-delay: .06s }
+.ov-cards .ov-card:nth-child(4){ animation-delay: .09s } .ov-cards .ov-card:nth-child(5){ animation-delay: .12s }
+.ov-cards .ov-card:nth-child(n+6){ animation-delay: .15s }
+.review .rv-unit:nth-child(2){ animation-delay: .03s } .review .rv-unit:nth-child(3){ animation-delay: .06s }
+.review .rv-unit:nth-child(4){ animation-delay: .09s } .review .rv-unit:nth-child(n+5){ animation-delay: .12s }
+
+/* ── Модалки / меню / палитра — пружинное появление ── */
+.modal-backdrop, .ctx-backdrop { animation: backdrop-in var(--dur-fast) var(--ease-out); }
+.modal       { animation: modal-in var(--dur-slow) var(--ease-spring); }
+.ctx-menu    { animation: pop-in var(--dur-fast) var(--ease-spring); transform-origin: top left; }
+.bl-status-menu, .ws-view-menu { animation: pop-in var(--dur-fast) var(--ease-spring); transform-origin: top right; }
+
+/* ── Тосты — выезд справа с пружиной ── */
+.toast { animation: toast-in var(--dur-med) var(--ease-spring) both; }
+
+/* ── Пульс статус-огоньков (точка дышит у working/awaiting) ── */
+.status-working .pane-dot, .status-awaiting .pane-dot { animation: dot-breathe 1.8s ease-in-out infinite; }
+.cp-dot.working, .cp-dot.awaiting { animation: dot-breathe 1.8s ease-in-out infinite; }
+/* счётчики сессий у воркспейса — мягкое «кольцо» (рендерятся только при count>0) */
+.sb-cnt.working, .sb-cnt.awaiting { animation: ring-pulse 1.8s ease-in-out infinite; }
+
+/* ── Liquid-glass кнопки: верхний блик + проблеск-свайп + подъём ── */
+.btn-primary, .btn-danger, .merge-apply-btn {
+  position: relative; overflow: hidden; isolation: isolate;
+  box-shadow: inset 0 1px 0 rgba(255,255,255,0.22);
+  transition: background-color var(--dur-fast) ease, color var(--dur-fast) ease,
+    box-shadow var(--dur-med) ease, transform var(--dur-fast) ease, filter var(--dur-fast) ease;
+}
+.btn-primary::after, .btn-danger::after, .merge-apply-btn::after {
+  content: ''; position: absolute; inset: 0; z-index: 1; pointer-events: none;
+  background: linear-gradient(115deg, transparent 30%, rgba(255,255,255,0.42) 48%, transparent 66%);
+  transform: translateX(-130%); transition: transform 0.6s var(--ease-out);
+}
+.btn-primary:hover:not(:disabled), .btn-danger:hover:not(:disabled) {
+  transform: translateY(-1px); box-shadow: inset 0 1px 0 rgba(255,255,255,0.3), 0 6px 18px rgba(88,166,255,0.32);
+}
+.btn-danger:hover:not(:disabled) { box-shadow: inset 0 1px 0 rgba(255,255,255,0.3), 0 6px 18px rgba(248,81,73,0.32); }
+.merge-apply-btn:hover:not(:disabled) { transform: translateY(-1px); }
+.btn-primary:hover:not(:disabled)::after, .btn-danger:hover:not(:disabled)::after,
+.merge-apply-btn:hover:not(:disabled)::after { transform: translateX(130%); }
+
+/* ── icon-bar: dock-эффект на логотипах CLI (виджет лимитов) ── */
+.cl-lg { transition: transform var(--dur-fast) var(--ease-spring); }
+.cl-chip:hover .cl-lg, .cl-row:hover .cl-lg { transform: scale(1.28) translateY(-1px); }
+
+/* ── Анимированные вкладки (expandable-tabs-вайб): пружинный «pop» активной ── */
+.tb-tabs button { transition: background-color var(--dur-fast) ease, color var(--dur-fast) ease, transform var(--dur-fast) ease; }
+.tb-tabs button.active { animation: seg-pop var(--dur-med) var(--ease-spring); }
+.tb-tabs button:hover:not(.active) { transform: translateY(-1px); }
+
+/* ── toggle-group: скользящая «пилюля» за активной опцией (5ч/7д, 2 опции) ── */
+.cl-seg { position: relative; }
+.cl-seg::before {
+  content: ''; position: absolute; z-index: 0; top: 2px; bottom: 2px; left: 2px;
+  width: calc(50% - 2px); border-radius: 5px; background: var(--accent);
+  transition: transform var(--dur-med) var(--ease-spring); pointer-events: none;
+}
+.cl-seg:has(button:nth-child(2).on)::before { transform: translateX(100%); }
+.cl-seg button { position: relative; z-index: 1; flex: 1; transition: color var(--dur-fast) ease; }
+.cl-seg button.on { background: transparent; } /* фон рисует пилюля */
+
+/* ── mode-toggle (Diff/код и т.п.): мягкий «pop» активного сегмента ── */
+.mode-toggle button { transition: background-color var(--dur-fast) ease, color var(--dur-fast) ease, transform var(--dur-fast) ease; }
+.mode-toggle button.on { animation: seg-pop var(--dur-fast) var(--ease-spring); }
+
+/* ── one-toggle: чекбоксы → iOS-свитчи (ползунок скользит, фон кроссфейдит) ── */
+input[type="checkbox"] {
+  appearance: none; -webkit-appearance: none;
+  width: 34px; height: 20px; padding: 0; flex-shrink: 0; border: none; border-radius: 11px;
+  background: var(--line-2); position: relative; cursor: pointer; display: inline-block;
+  transition: background-color var(--dur-med) ease;
+}
+input[type="checkbox"]::after {
+  content: ''; position: absolute; top: 2px; left: 2px; width: 16px; height: 16px;
+  border: none; border-radius: 50%; background: #fff; box-shadow: 0 1px 3px rgba(0,0,0,0.45);
+  transform: none; transition: transform var(--dur-med) var(--ease-spring);
+}
+input[type="checkbox"]:hover { border: none; background: #45454f; }
+input[type="checkbox"]:checked { background: var(--accent); border: none; }
+input[type="checkbox"]:checked::after { transform: translateX(14px); width: 16px; height: 16px; border: none; }
+
+/* ── Окно «все горячие клавиши» — всплывашка у кнопки ⓘ в шапке (как ⓘ в редакторе) ── */
+.tb-keys-wrap { position: relative; display: inline-flex; -webkit-app-region: no-drag; }
+.tb-keys { font-size: 14px; }
+.tb-keys.on { color: var(--accent); background: var(--bg-3); }
+.sc-backdrop { position: fixed; inset: 0; z-index: 300; -webkit-app-region: no-drag; }
+.sc-pop {
+  position: absolute; top: calc(100% + 6px); right: 0; z-index: 320; -webkit-app-region: no-drag;
+  width: 332px; max-height: 74vh; overflow-y: auto;
+  background: var(--bg-2); border: 1px solid var(--line-2); border-radius: 11px;
+  padding: 12px 14px; box-shadow: 0 16px 44px rgba(0, 0, 0, 0.55);
+  transform-origin: top right; animation: pop-in 0.14s cubic-bezier(0.34, 1.56, 0.64, 1);
+}
+.sc-pop-title { font-size: 13px; font-weight: 650; color: var(--text); margin-bottom: 11px; }
+.sc-group { margin-bottom: 12px; }
+.sc-group:last-child { margin-bottom: 2px; }
+.sc-group-title { font-size: 10px; letter-spacing: 0.7px; text-transform: uppercase; color: var(--text-3); margin-bottom: 7px; }
+.sc-row { display: flex; align-items: baseline; gap: 9px; margin-bottom: 7px; }
+.sc-keys { flex: 0 0 auto; display: inline-flex; gap: 4px; flex-wrap: wrap; }
+.sc-desc { font-size: 11.5px; color: var(--text-2); line-height: 1.4; }
+.sc-pop kbd {
+  font-family: inherit; color: var(--text); background: var(--bg-3);
+  border: 1px solid var(--line-2); border-radius: 5px; padding: 1px 6px; font-size: 10px; white-space: nowrap;
+}

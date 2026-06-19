@@ -92,6 +92,8 @@ interface State {
 
   // RFC 0017 X1: открыта ли командная палитра (Cmd+K). Только runtime — на диск не пишем.
   commandPaletteOpen: boolean
+  // Окно «все горячие клавиши» (кнопка ⌨ в шапке / клавиша «?»). Runtime-флаг.
+  shortcutsOpen: boolean
   // RFC 0017 X2: фильтр дерева файлов «показать только изменённые». UI-флаг как
   // sidebarCollapsed/rightPanelVisible — только runtime (на диск не пишем), сбрасывается
   // при перезапуске. Семантику включения держит сам FileTree.
@@ -128,6 +130,7 @@ interface State {
   toggleRightPanel: () => void
   // RFC 0017 X1: открыть/закрыть командную палитру (Cmd+K).
   setCommandPaletteOpen: (v: boolean) => void
+  setShortcutsOpen: (v: boolean) => void
   // RFC 0017 X2: переключить фильтр дерева «только изменённые».
   toggleFileTreeShowOnlyChanged: () => void
 
@@ -253,6 +256,7 @@ export const useStore = create<State>((set, get) => ({
   sidebarCollapsed: false,
   rightPanelVisible: true,
   commandPaletteOpen: false,
+  shortcutsOpen: false,
   fileTreeShowOnlyChanged: false,
   sessionOutputTail: {},
   selectedFileByWs: {},
@@ -505,6 +509,7 @@ export const useStore = create<State>((set, get) => ({
 
   // RFC 0017 X1: открыть/закрыть командную палитру (runtime, не персистим).
   setCommandPaletteOpen: (v) => set({ commandPaletteOpen: v }),
+  setShortcutsOpen: (v) => set({ shortcutsOpen: v }),
   // RFC 0017 X2: фильтр дерева «только изменённые» (runtime, как панели — не персистим).
   toggleFileTreeShowOnlyChanged: () =>
     set((s) => ({ fileTreeShowOnlyChanged: !s.fileTreeShowOnlyChanged })),
