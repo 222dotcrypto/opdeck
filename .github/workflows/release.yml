@@ -4,7 +4,7 @@ name: Release
 # Подпись ad-hoc (без Apple-сертификата) → у пользователя предупреждение Gatekeeper,
 # снимается install.sh (xattr -dr com.apple.quarantine). Для нотаризации — добавить
 # секреты Apple Developer + TAURI_SIGNING_* (см. доку tauri-action).
-# ВНИМАНИЕ: перед первой публикацией сверить актуальную мажорную версию tauri-action.
+# tauri-action закреплён на @v0 (актуальный мажор, поддерживает Tauri 2) — менять не нужно.
 
 on:
   push:
@@ -41,7 +41,7 @@ jobs:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         with:
           tagName: ${{ github.ref_name }}
-          releaseName: 'Deck ${{ github.ref_name }}'
+          releaseName: 'opdeck ${{ github.ref_name }}'
           releaseBody: 'См. историю коммитов.'
           releaseDraft: false
           prerelease: false

@@ -103,7 +103,7 @@ DMG_URL=""
 while IFS= read -r line; do
     if echo "$line" | grep -qE "\.dmg\""; then
         # Extract URL from the line
-        url=$(echo "$line" | grep -o '"browser_download_url":"[^"]*"' | cut -d'"' -f4)
+        url=$(echo "$line" | grep -o '"browser_download_url": *"[^"]*"' | cut -d'"' -f4)
         if echo "$url" | grep -qiE "$ARCH_PATTERN"; then
             DMG_URL="$url"
             break
@@ -113,7 +113,7 @@ done < "$RELEASE_JSON"
 
 # Fallback: if no architecture-specific match, try any .dmg
 if [ -z "$DMG_URL" ]; then
-    DMG_URL=$(grep -o '"browser_download_url":"[^"]*\.dmg"' "$RELEASE_JSON" | head -1 | cut -d'"' -f4)
+    DMG_URL=$(grep -o '"browser_download_url": *"[^"]*\.dmg"' "$RELEASE_JSON" | head -1 | cut -d'"' -f4)
 fi
 
 if [ -z "$DMG_URL" ]; then
