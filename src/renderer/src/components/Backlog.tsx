@@ -374,7 +374,7 @@ export default function Backlog(): JSX.Element {
           onChange={(e) => setQuick(e.target.value)}
           onKeyDown={(e) => e.key === 'Enter' && add()}
         />
-        <button className="btn-primary icon" title="Добавить задачу (Ctrl+Shift+C)" onClick={add}>
+        <button className="bl-add-btn" title="Добавить задачу (Ctrl+Shift+C)" onClick={add}>
           ＋
         </button>
       </div>
