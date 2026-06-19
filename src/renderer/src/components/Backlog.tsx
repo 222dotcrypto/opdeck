@@ -371,12 +371,6 @@ export default function Backlog(): JSX.Element {
         </button>
       </div>
 
-      {tasks.length === 0 && (
-        <div className="ov-empty">
-          Беклог пуст. Запиши идею/баг и кнопкой «В работу» отдай агенту первым промтом.
-        </div>
-      )}
-
       <div className="bl-board">
         {COLUMNS.map((c) => (
           <StatusColumn key={c.id} status={c.id} label={c.label} tasks={byStatus[c.id]} />

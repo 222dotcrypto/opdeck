@@ -19,6 +19,14 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
+      # node-gyp (через node-pty/electron-builder postinstall) использует distutils,
+      # которого нет в Python 3.12+ на свежих раннерах → npm ci падает. Python 3.11
+      # ещё содержит distutils, node-gyp находит его на PATH и собирает нативные модули.
+      - name: Python (distutils for node-gyp)
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
       - name: Node
         uses: actions/setup-node@v4
         with:
