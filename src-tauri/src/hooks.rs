@@ -10,44 +10,11 @@
 //   Codex  — `codex -p deck` (оверлей ~/.codex/deck.config.toml поверх базового config.toml).
 
 use std::collections::HashMap;
-use std::io::Write as _;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Mutex, OnceLock};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use tauri::Manager;
-
-// ВРЕМЕННАЯ диагностика уведомлений (удалить после подтверждения, что приходят).
-// Пишет в ~/Library/Logs/Deck-Dev-notify.log.
-fn dbg_notify_log(line: &str) {
-    dbg_log_to("Library/Logs/Deck-Dev-notify.log", line);
-}
-
-fn dbg_log_to(rel: &str, line: &str) {
-    if let Some(home) = dirs::home_dir() {
-        let p = home.join(rel);
-        if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open(p) {
-            let ts = SystemTime::now()
-                .duration_since(UNIX_EPOCH)
-                .map(|d| d.as_secs())
-                .unwrap_or(0);
-            let _ = writeln!(f, "{ts} {line}");
-        }
-    }
-}
-
-// Экранирование строки для строкового литерала AppleScript ("...").
-fn applescript_quote(s: &str) -> String {
-    let mut out = String::from("\"");
-    for ch in s.chars() {
-        match ch {
-            '\\' => out.push_str("\\\\"),
-            '"' => out.push_str("\\\""),
-            _ => out.push(ch),
-        }
-    }
-    out.push('"');
-    out
-}
+use tauri_plugin_notification::NotificationExt;
 
 // ── Подавление уведомлений ──
 // Не дёргаем уведомлением, если окно в фокусе И активна именно эта сессия (юзер уже тут).
@@ -93,9 +60,9 @@ pub fn notify_status(app: &tauri::AppHandle, session_id: &str, status: &str) {
         "ready" => "🟢 Агент закончил",
         _ => return,
     };
-    dbg_notify_log(&format!("enter session={session_id} status={status}"));
+    log::debug!("notify enter session={session_id} status={status}");
     if status != "ready" && is_suppressed(session_id) {
-        dbg_notify_log("→ suppressed (фокус+активная, не-ready)");
+        log::debug!("notify skip: suppressed (focus+active, non-ready)");
         return;
     }
     let (notify_on_done, sound_on, sess_title) = {
@@ -111,78 +78,30 @@ pub fn notify_status(app: &tauri::AppHandle, session_id: &str, status: &str) {
         (s.data.settings.notify_on_done, s.data.settings.sound_on_done, t)
     };
     if status == "ready" && !notify_on_done {
-        dbg_notify_log("→ skip ready: notify_on_done=false");
+        log::debug!("notify skip ready: notify_on_done=false");
         return;
     }
     // антиспам: повторные «ждёт ответа» по той же сессии глушим (статус-цвет не трогаем)
     if status == "awaiting" && awaiting_recently_notified(session_id) {
-        dbg_notify_log("→ skip awaiting: throttled (<3мин)");
+        log::debug!("notify skip awaiting: throttled (<3min)");
         return;
     }
     let body = if sess_title.is_empty() { "сессия".to_string() } else { sess_title };
 
-    // Иконка баннера = иконка приложения (наш логотип Deck). Предпочитаем terminal-notifier
-    // с `-sender <bundle-id>`: баннер берёт иконку самого Deck (а не Script Editor, как у
-    // голого `osascript display notification`), и клик по нему активирует приложение.
-    // Если terminal-notifier не установлен — откат на osascript (баннер придёт, но иконка
-    // будет дефолтная). macOS не доставляет уведомления tauri-plugin от ad-hoc-подписи —
-    // поэтому через внешний процесс, а не нативный плагин.
-    let bundle_id = app.config().identifier.clone();
-    let posted = if let Some(tn) = find_terminal_notifier() {
-        let mut c = std::process::Command::new(tn);
-        c.arg("-title")
-            .arg(heading)
-            .arg("-message")
-            .arg(&body)
-            .arg("-sender")
-            .arg(&bundle_id);
-        if sound_on {
-            c.arg("-sound").arg("Ping");
-        }
-        let ok = c.spawn().is_ok();
-        dbg_notify_log(&format!(
-            "→ terminal-notifier status={status} sender={bundle_id} spawned={ok}"
-        ));
-        ok
-    } else {
-        false
-    };
-    if !posted {
-        let mut script = format!(
-            "display notification {} with title {}",
-            applescript_quote(&body),
-            applescript_quote(heading)
-        );
-        if sound_on {
-            script.push_str(" sound name \"Ping\"");
-        }
-        let spawned = std::process::Command::new("osascript")
-            .arg("-e")
-            .arg(&script)
-            .spawn()
-            .is_ok();
-        dbg_notify_log(&format!("→ osascript(fallback) status={status} spawned={spawned}"));
+    // RFC 0003 (поправка 2026-06-18): шлём РОДНЫМ плагином уведомлений под собственной
+    // личностью приложения (identifier берётся из конфига, напр. app.opdeck.desktop) — баннер
+    // с именем/иконкой opdeck. Без внешнего terminal-notifier (его у пользователя может не быть)
+    // и без osascript-подмены под Script Editor. Разрешение спрашивается при старте
+    // (lib.rs: request_permission). Баннер показывается по настройке источника «opdeck» в
+    // Системных настройках → Уведомления. Раньше шли через -sender, который macOS 26 глушил.
+    let mut b = app.notification().builder().title(heading).body(body.as_str());
+    if sound_on {
+        b = b.sound("default");
     }
-}
-
-// Путь к terminal-notifier (Homebrew arm64/intel или из PATH). None → не установлен.
-fn find_terminal_notifier() -> Option<String> {
-    for p in [
-        "/opt/homebrew/bin/terminal-notifier",
-        "/usr/local/bin/terminal-notifier",
-    ] {
-        if std::path::Path::new(p).exists() {
-            return Some(p.to_string());
-        }
+    match b.show() {
+        Ok(()) => log::debug!("notify shown (native) status={status} body={body}"),
+        Err(e) => log::warn!("notify failed (native) status={status}: {e}"),
     }
-    std::process::Command::new("/usr/bin/which")
-        .arg("terminal-notifier")
-        .output()
-        .ok()
-        .filter(|o| o.status.success())
-        .and_then(|o| String::from_utf8(o.stdout).ok())
-        .map(|s| s.trim().to_string())
-        .filter(|s| !s.is_empty())
 }
 
 static HOOK_INFO: OnceLock<(u16, String)> = OnceLock::new();
