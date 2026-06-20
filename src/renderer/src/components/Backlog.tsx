@@ -132,12 +132,13 @@ function SendPicker({
 
   const [agentId, setAgentId] = useState<string>(pickable[0]?.id ?? 'shell')
   const [wsId, setWsId] = useState<string>(workspaces[0]?.id ?? '')
+  const [clone, setClone] = useState(false)
   const [busy, setBusy] = useState(false)
 
   const send = async (): Promise<void> => {
     if (!wsId) return
     setBusy(true)
-    await sendTaskToAgent(task.id, agentId, wsId)
+    await sendTaskToAgent(task.id, agentId, wsId, clone)
     setBusy(false)
     onDone()
   }
@@ -168,6 +169,13 @@ function SendPicker({
           ))}
         </select>
       )}
+      <label
+        className="af-check"
+        title="git worktree: агент получает отдельную копию кода в своей ветке, потом сливаешь в основную"
+      >
+        <input type="checkbox" checked={clone} onChange={(e) => setClone(e.target.checked)} />
+        <span>Своя ветка — отдельная копия кода для этого агента</span>
+      </label>
       <div className="af-actions">
         <button className="btn-ghost" onClick={onDone} disabled={busy}>
           Отмена

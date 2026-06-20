@@ -178,8 +178,14 @@ interface State {
   addTask: (partial?: Partial<BacklogTask>) => BacklogTask
   updateTask: (id: string, patch: Partial<BacklogTask>) => void
   deleteTask: (id: string) => void
-  // отправить задачу первым промтом в новую сессию выбранного агента/воркспейса
-  sendTaskToAgent: (taskId: string, agentId: AgentId, workspaceId: string) => Promise<void>
+  // отправить задачу первым промтом в новую сессию выбранного агента/воркспейса.
+  // clone=true → агент получает свою ветку (git worktree), как галочка в AddSessionForm.
+  sendTaskToAgent: (
+    taskId: string,
+    agentId: AgentId,
+    workspaceId: string,
+    clone?: boolean
+  ) => Promise<void>
 }
 
 // RFC 0011: дебаунс рефреша списка изменений по событию fs:changed (правки сыплются
@@ -898,7 +904,7 @@ export const useStore = create<State>((set, get) => ({
   // выбранного агента/воркспейса. Переиспользуем готовый createSession (та же дорога,
   // что у AddSessionForm). Помечаем задачу sent + храним sentSessionId (аудит, разовая
   // отправка). Переключаемся в воркспейс и фокусируем новую сессию — пилот сразу видит её.
-  sendTaskToAgent: async (taskId, agentId, workspaceId) => {
+  sendTaskToAgent: async (taskId, agentId, workspaceId, clone) => {
     const st = get()
     const task = st.tasks.find((t) => t.id === taskId)
     if (!task) return
@@ -915,6 +921,7 @@ export const useStore = create<State>((set, get) => ({
       workspaceId,
       agentId,
       cwd: ws.folder || undefined,
+      clone, // своя ветка (git worktree), если пилот поставил галочку в SendPicker
       firstPrompt: firstPrompt.trim() || undefined
     })
     if (!session) return // createSession уже показал тост об ошибке
